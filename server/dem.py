@@ -86,6 +86,7 @@ DECODED_VERSION = 4          # 2: tiles past the lidar's depth upsampled from it
                              # filled (fill_holes); 3: Canada's HRDEM lidar (hrdem.py) from z13 down; 4: LidarBC,
                              # and z12 / z13 shifted to its ground (BIAS_*)
 ARCTIC_VERSION = arcticdemmod.GROUND_VERSION    # the mirror's tiles with ArcticDEM's ground in them
+ARCTIC_MAX_ZOOM = 15        # ArcticDEM's ground is made for tiles of this zoom; deeper ones are enlarged from them
 MAX_ZOOM = 15               # AWS stops at z15 (the far field's zooms: zoom_for's default cap)
 # The near terrain and the road profiles read Mapterhorn's lidar one zoom deeper where it has it (the user, 2026-10-21:
 # "the terrain data gets smoothed ... sharper terrain features get lost": z16 is ~0.8 m a pixel at 48 N, z15 ~1.6 m, the
@@ -488,8 +489,17 @@ class Dem:
             return a
         if z < FINE_MIN_ZOOM:
             return self._arctic_bias(key, a)
+        if z > ARCTIC_MAX_ZOOM:
+            # (a deeper tile is its z15 parent enlarged where Mapterhorn has no lidar: that parent already has the
+            # mosaic's ground, ~1.2 m pixels for its 2 m; made again per z16 tile it is 4x the work, and the road
+            # planners read z16)
+            return a
         try:
             got = self.arctic.tile(z, x, y, a)
+        except arcticdemmod.NotCached:      # (its bytes are being fetched: the next build of the place has them)
+            self._count("arcticdem:pending")
+            self._partial()
+            return a
         except (netfetch.FetchError, OSError, ValueError, cogmod.CogError) as e:
             self._count("arcticdem:error")
             self._partial()                 # (not mirrored: asked again next time)
@@ -507,12 +517,16 @@ class Dem:
 
     def _arctic_bias(self, key, a):
         """Distant tile key's heights a moved to ArcticDEM's ground level (its open land, from a coarse overview)
-        where Mapterhorn's sit off it, so the near terrain does not lie in a trench (as _hrdem_bias)."""
+        where Mapterhorn's sit off it, so the near terrain meets them without a step (as _hrdem_bias)."""
         z, x, y = key
         if z not in BIAS_ZOOMS:
             return a
         try:
             got = self.arctic.sparse_ground(z, x, y)
+        except arcticdemmod.NotCached:
+            self._count("arcticdem-bias:pending")
+            self._partial()
+            return a
         except (netfetch.FetchError, OSError, ValueError, cogmod.CogError) as e:
             self._count("arcticdem-bias:error")
             self._partial()

@@ -2115,6 +2115,8 @@ def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
     memo = feats.__dict__.setdefault("_road_specs", {})
     import europewalks
     import franceroads
+    import rusidewalks          # (BeamNG.Earth-RU: streets with their sidewalks mapped beside them, before the tags are read)
+    rusidewalks.apply(feats)
     k = _street_spec_key(urban_fn, widths, left_hand)     # (franceroads / europewalks on: their own; off: as before)
     got = memo.get(k)
     if got is None:             # (the measured widths on the specs without them: those are asked for too, _bridge_reach)
@@ -2122,7 +2124,7 @@ def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
         import germanroads
         extra = (widths is not None, bool(left_hand)) + ((franceroads.VERSION,) if franceroads.ON else ()) + (
             (photosurface.TAG,) if photosurface.ON else ()) + ((europewalks.VERSION,) if europewalks.enabled() else ()) + (
-            (germanroads.VERSION,) if germanroads.ON else ()) + roadsurf.layer_tags(feats)
+            (germanroads.VERSION,) if germanroads.ON else ()) + roadsurf.layer_tags(feats) + (rusidewalks.VERSION,)
         cid = feats.__dict__.get("_bnge_cell")
         # (the land cover's too, by this process's urban_fn: its own Surface, the same all along; a city layer's
         # specs with its parking widths were ~0.37 s of each of its road tiles after every reload, 2026-11-02)

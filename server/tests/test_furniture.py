@@ -301,10 +301,15 @@ class PoleTest(unittest.TestCase):
     def test_buried_lines_no_poles(self):
         """The country's low-voltage lines underground (furniture.BURIED_LV, the user 2026-10-26: poles "almost
         everywhere"): that share of the roads (hashed) have no poles; all of them in the Netherlands."""
-        self.assertEqual(furniture.buried_share("nl"), 1.0)
-        self.assertEqual(furniture.buried_share("US"), 0.0)
-        self.assertEqual(furniture.buried_share(None), 0.0)
-        self.assertEqual(furniture.buried_share("ch"), 0.86)   # GitHub #911: rural Switzerland mostly cabled
+        from unittest import mock
+        with mock.patch.object(furniture, "GUESSED_POLES", True):      # (upstream's table)
+            self.assertEqual(furniture.buried_share("nl"), 1.0)
+            self.assertEqual(furniture.buried_share("US"), 0.0)
+            self.assertEqual(furniture.buried_share(None), 0.0)
+            self.assertEqual(furniture.buried_share("ch"), 0.86)   # GitHub #911: rural Switzerland mostly cabled
+        with mock.patch.object(furniture, "GUESSED_POLES", False):     # BeamNG.Earth-RU's default: no guessed poles
+            self.assertEqual(furniture.buried_share("RU"), 1.0)
+            self.assertEqual(furniture.buried_share("US"), 1.0)
         rows = furniture.place([road("c", "tertiary", False)], [], (0, 0, 256, 256), wires=[], buried=1.0)
         self.assertNotIn(furniture.G_POLE, [x[0] for x in rows])
         roads_ = [road(f"r{k}", "tertiary", False) for k in range(200)]

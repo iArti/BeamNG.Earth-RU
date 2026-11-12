@@ -738,8 +738,17 @@ BURIED_LV = {"NL": 1.0, "CH": 0.86, "GB": 0.81, "DE": 0.75, "DK": 0.65, "BE": 0.
              "FR": 0.27, "PT": 0.19, "AT": 0.15, "ES": 0.14}
 
 
+# BeamNG.Earth-RU: no guessed utility poles (guessed wooden poles and wires stood along streets whose real poles are
+# concrete lamp and trolleybus ones, or none): every line counts as buried, so the roads get no guessed poles, a town's street its lamps on posts; the mapped poles and power lines
+# (mappedpoles.py, powerlines.py) stay. BNE_GUESSED_POLES=on: as upstream.
+GUESSED_POLES = os.environ.get("BNE_GUESSED_POLES", "off").lower() in ("on", "1", "true")
+
+
 def buried_share(country):
-    """The share of the country's (ISO 3166 alpha-2) low-voltage lines underground (BURIED_LV), else 0."""
+    """The share of the country's (ISO 3166 alpha-2) low-voltage lines underground (BURIED_LV), else 0; 1 everywhere
+    unless GUESSED_POLES."""
+    if not GUESSED_POLES:
+        return 1.0
     return BURIED_LV.get(str(country or "").upper(), 0.0)
 # The lamps' lenses (night lighting: nightlights.lua lights their material after dusk and puts its lights at them;
 # tools/build_lamp_lens.py): the stock heads' glass is a material every building's windows share. At each lamp's glass

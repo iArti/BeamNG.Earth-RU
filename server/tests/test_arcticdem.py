@@ -49,7 +49,7 @@ class FilesTest(unittest.TestCase):
         self.assertEqual(arcticdem.file_of(25000, -3375000), "07_41_1_1")
         self.assertEqual(arcticdem.file_of(-25000, -3325000), "07_40_2_2")
         self.assertEqual(arcticdem.file_of(0.0, -3400000.0), "07_41_1_1")
-        # the Karelian Isthmus (60.70 N, 29.90 E): file 32_72_2_1 (read from PGC's bucket, 2026-11-11)
+        # 60.70 N, 29.90 E (north of Saint Petersburg): file 32_72_2_1, as PGC's bucket has it
         x, y = arcticdem.polar_xy(60.70, 29.90)
         self.assertEqual(arcticdem.file_of(float(x), float(y)), "32_72_2_1")
         self.assertEqual(arcticdem.file_url("32_72_2_1"),
@@ -113,6 +113,17 @@ class HelpersTest(unittest.TestCase):
         # never above the surface (the speckle smoothing aside: compared with the surface smoothed as much)
         self.assertTrue(np.all(g <= arcticdem.gauss(h, arcticdem.SMOOTH_M / px) + 0.05))
 
+    def test_a_big_flat_roof_is_not_ground(self):
+        """A shopping centre 200 m across, its roof flat 15 m up, no trees, not mapped built-up: its roof was its own
+        low point and open land (it stood as a hill); Mapterhorn's ground has no building there."""
+        px = 2.0
+        h = np.full((200, 200), 30.0, np.float32)
+        h[40:160, 40:160] = 45.0
+        base = np.full((200, 200), 35.0, np.float32)     # (Mapterhorn 5 m over the mosaic: GLO-30's usual offset)
+        g = arcticdem.ground(h, np.zeros_like(h), None, np.ones_like(h, bool), base, px)
+        self.assertLess(float(np.abs(g[100, 100] - 30.0)), 0.6)
+        self.assertLess(float(np.abs(g[10, 10] - 30.0)), 0.6)
+
     def test_ground_in_villages_from_the_streets(self):
         px = 2.0
         h = np.full((128, 128), 50.0, np.float32)
@@ -145,7 +156,7 @@ class Fake(arcticdem.ArcticDem):
         super().__init__("/nonexistent/dem", None, rasters=FakeRasters(), geoid=FakeGeoid(n))
         self._s, self._c, self._b = surface, canopy, built
 
-    def surface(self, z, x, y, size=arcticdem.TILE, min_px=arcticdem.LATTICE_M, margin=0):
+    def surface(self, z, x, y, size=arcticdem.TILE, min_px=arcticdem.LATTICE_M, margin=0, disk=False):
         if self._s is None:
             return None
         s = np.pad(self._s, margin, mode="edge") if margin else self._s.copy()
@@ -161,7 +172,7 @@ class Fake(arcticdem.ArcticDem):
         return getattr(self, "_sparse", None)
 
 
-KEY = (15, 18911, 9126)     # a z15 tile on the Karelian Isthmus
+KEY = (15, 18911, 9126)     # a z15 tile north of 60 N
 
 
 class GroundTest(unittest.TestCase):
@@ -240,11 +251,36 @@ class DemBlendTest(unittest.TestCase):
         self.assertIn(far, d.arctic_served)
         del n
 
+    def test_deeper_tiles_left_to_their_parent(self):
+        d = self._dem(Fake(np.full((512, 512), 118.0, np.float32)))
+        a = np.full((512, 512), 105.0, np.float32)
+        self.assertIs(d._arctic((16, KEY[1] * 2, KEY[2] * 2), a), a)     # (enlarged from the z15 tile that has it)
+
     def test_the_south_untouched(self):
         d = self._dem(Fake(np.full((512, 512), 118.0, np.float32)))
         a = np.full((512, 512), 105.0, np.float32)
         self.assertIs(d._arctic((15, 18911, 10500), a), a)               # ~55 N: no mosaic
         self.assertIs(self._dem(None)._arctic(KEY, a), a)
+
+    def test_bytes_not_on_disk_keep_mapterhorn_and_are_fetched_after(self):
+        """The build path never waits on PGC's bucket: what is not on disk yet is fetched in the background, the tile
+        keeps Mapterhorn's heights (and is not mirrored: made again once the bytes are there)."""
+        calls = []
+
+        class Slow(Fake):
+            def surface(self, *a, disk=False, **k):
+                calls.append(disk)
+                if disk:
+                    raise arcticdem.NotCached("not yet")
+                return None
+        f = Slow(None)
+        d = self._dem(f)
+        a = np.full((512, 512), 105.0, np.float32)
+        self.assertIs(d._arctic(KEY, a), a)
+        self.assertTrue(d._local.partial)
+        f._warm_pool.shutdown(wait=True)
+        self.assertEqual(calls, [True, False])          # once from the disk, once fetched in the background
+        self.assertEqual(f.stats["pending"], 1)
 
     def test_failure_keeps_mapterhorn(self):
         class Broken(Fake):
@@ -258,7 +294,7 @@ class DemBlendTest(unittest.TestCase):
     def test_coarse_at(self):
         d = self._dem(Fake(None))
         self.assertTrue(d.arctic_at(60.70, 29.90))
-        self.assertFalse(d.arctic_at(55.75, 37.62))          # Moscow
+        self.assertFalse(d.arctic_at(55.75, 37.62))          # (south of the mosaic)
         self.assertFalse(self._dem(None).arctic_at(60.70, 29.90))
 
 

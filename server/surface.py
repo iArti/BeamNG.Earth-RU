@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import beaches
+import builtground
 import fast
 import mapgeom
 import heightmap
@@ -903,6 +904,14 @@ def _square_pts(frame, x0, y0, size):
     return np.asarray(la), np.asarray(lo)
 
 
+def _square_buildings(frame, x0, y0, size, surface):
+    """The buildings Features around a photo square (Surface.buildings; never waits). BeamNG.Earth-RU: builtground."""
+    if surface is None or not builtground.ON or not hasattr(surface, "buildings"):
+        return []
+    la, lo = _square_pts(frame, x0, y0, size)
+    return surface.buildings(la, lo)
+
+
 def _square_lots(frame, x0, y0, size, surface):
     """The infrastructure and land-use Features around a photo square (Surface.lots; never waits)."""
     if surface is None or not hasattr(surface, "lots"):
@@ -1050,6 +1059,7 @@ def paint_square(rgb, frame, x0, y0, size, surface, widths=None, simple=False, p
         rgb = photo_golf(rgb, frame, x0, y0, size, feats)
         rgb = photo_lots(rgb, frame, x0, y0, size, feats)
         rgb = photo_pads(rgb, frame, x0, y0, size, _square_pads(frame, x0, y0, size, surface))     # (under the roads)
+        rgb = builtground.photo_built(rgb, frame, x0, y0, size, _square_buildings(frame, x0, y0, size, surface))
     if not roads:
         return rgb
     return photo_roads(rgb, frame, x0, y0, size, roads, surface.urban, widths, simple=simple)
@@ -1593,7 +1603,39 @@ def _plazas(feats):
     cls, sub = feats.attrs.get("class"), feats.attrs.get("subtype")
     if cls is None or sub is None:
         return None
-    return (sub.astype(str) == "pedestrian") & np.isin(cls.astype(str), list(PLAZA_CLASSES))
+    m = (sub.astype(str) == "pedestrian") & np.isin(cls.astype(str), list(PLAZA_CLASSES))
+    if m.any():                 # (BeamNG.Earth-RU: a square that is only a place's name is not paved; kept on the layer)
+        named = feats.__dict__.get("_named_squares")
+        if named is None:
+            named = feats.__dict__["_named_squares"] = _name_only_squares(feats)
+        m &= ~named
+    return m
+
+
+# Tags that make a land_use "plaza" a paved area: OpenStreetMap's pedestrian areas (highway=pedestrian, area:highway),
+# a mapped surface, or what stands on it. A polygon with none of them but place=square is the square as a named place
+# (Overture's land_use class plaza either way): its carriageways, tram tracks and islands inside it, all of which a
+# paving over the whole polygon covered (BeamNG.Earth-RU).
+PAVED_SQUARE_KEYS = ("highway", "area:highway", "surface", "amenity", "leisure", "man_made", "building", "landuse")
+
+
+def _name_only_squares(feats):
+    """bool (n,): land_use features tagged place=square / place=* with none of PAVED_SQUARE_KEYS. Pure."""
+    import json
+    tags = feats.attrs.get("tags")
+    out = np.zeros(len(feats), bool)
+    if tags is None:
+        return out
+    for i, t in enumerate(tags.tolist()):
+        if not t:
+            continue
+        try:
+            d = json.loads(t) if isinstance(t, str) else dict(t)
+        except (TypeError, ValueError):
+            continue
+        if "place" in d and not any(k in d for k in PAVED_SQUARE_KEYS):
+            out[i] = True
+    return out
 
 
 def _paint(idx, lat, lon, feats_list, select, material):
@@ -2067,6 +2109,23 @@ class Surface:
                     out.append(self.md.cell(key, layers=(layer,), kind="background").layers.get(layer))
                 except Exception as e:      # an unreadable cache file: like a missing one
                     log.debug("surface: %s of %s: %s: %s", layer, key, type(e).__name__, e)
+        return out
+
+    def buildings(self, lat, lon):
+        """The "buildings" Features of the cells around the points that are cached (the ground round them:
+        builtground.py); never waits (missing cells are fetched in the background). BeamNG.Earth-RU."""
+        lat = np.asarray(lat, np.float64)
+        lon = np.asarray(lon, np.float64)
+        out = []
+        for key in mapcells.cells_for_points(lat, lon):
+            if not self.md.has(key, "buildings"):
+                self._queue(key, ("buildings",))
+                revisit.fault()         # (left out: nothing built now is kept)
+                continue
+            try:
+                out.append(self.md.cell(key, layers=("buildings",), kind="background").layers.get("buildings"))
+            except Exception as e:      # an unreadable cache file: like a missing one
+                log.debug("surface: buildings of %s: %s: %s", key, type(e).__name__, e)
         return out
 
     def urban(self, lat, lon):

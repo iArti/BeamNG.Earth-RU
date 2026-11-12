@@ -1,7 +1,7 @@
 """The Arctic's 2 m elevation: PGC's ArcticDEM v4.1 mosaic, made into ground for the near terrain (BeamNG.Earth-RU).
 
-Why: north of 60 N outside the national lidar areas (Russia's north-west, Karelia, the Kola peninsula, Siberia's
-north, northern Scandinavia) Mapterhorn is Copernicus GLO-30: 30 m pixels of a surface model, forests and all. The
+Why: north of 60 N outside the national lidar areas Mapterhorn is Copernicus GLO-30: 30 m pixels of a surface model,
+forests and all. The
 ArcticDEM mosaic covers all land north of 60 N at 2 m, from stereo satellite imagery (Maxar), so the shape of the
 ground (ditches, embankments, river banks, rock outcrops, hills under 30 m) is there - but it is a surface model too.
 
@@ -18,19 +18,20 @@ From surface to ground (tile()):
 2. ellipsoidal heights to EGM2008 (Mapterhorn's datum): the geoid height N from gravity.py's EGM2008 model where its
    coefficients are on disk (earthd's real gravity downloads them), on the corners of a z10 grid (N changes by
    centimetres over its ~10-20 km); without them, the median offset to the tile's Mapterhorn heights over open ground;
-3. the ground only where the mosaic sees it (ground()): open land (Meta / WRI's canopy height, CHMv2, smoothed to the
-   stereo model's scale, under OPEN_CANOPY_M) and, where ESA WorldCover says built-up, only its lowest points (within
-   LOW_M of the minimum over LOW_WINDOW_M: streets, yards, not roofs). Under trees and buildings the ground is
-   interpolated from the open ground around (normalised convolution, finest of FILL_SIGMAS_M with enough support),
-   and past their reach it is Mapterhorn's shape moved to the open ground's level. Never above the surface; the
-   stereo model's speckle smoothed over SMOOTH_M.
-   (The first try subtracted the canopy model from the surface and opened the built-up areas: the stereo surface does
-   not reach the crowns' tops, so every stand became a pit 4-6 m deep, and the villages pits down to their ditches.
-   "From fairly flat to a front line of trenches", the user on the Karelian Isthmus, 2026-11-11.)
+3. the ground only where the mosaic sees it (seen(), ground()): open land (no trees by ESA WorldCover, or by Meta /
+   WRI's canopy height with BNE_ARCTIC_CHM, smoothed to the stereo model's scale), in built-up areas only its lowest
+   points (within LOW_M of the minimum over LOW_WINDOW_M: streets and yards, not roofs), and nowhere the surface stands
+   RAISED_M over Mapterhorn's ground (large buildings, stands of trees the land cover misses). Under trees and
+   buildings the ground is interpolated from the open ground around (normalised convolution over FILL_SIGMAS_M), and
+   past its reach it is Mapterhorn's shape moved to the open ground's level. Never above the surface; the stereo
+   model's speckle smoothed over SMOOTH_M. (Subtracting a canopy model from the surface does not work: the stereo
+   surface does not reach the crowns' tops, and every stand became a pit several metres deep.)
 4. checked against Mapterhorn's tile: pixels more than MAX_DIFF_M off it are dropped (the stereo models' blunders over
    water and in shadow), and the sea (Mapterhorn's exact 0) stays the sea.
 
-dem.py blends the result into its tiles of z15 and deeper with a feathered edge (hrdem.feather), as for HRDEM.
+dem.py blends the result into its z15 tiles with a feathered edge (hrdem.feather), as for HRDEM, and moves its
+z12-z14 tiles to the same level (sparse_ground). The build path reads the mosaic from the disk only: what is missing
+is fetched in the background and used by the next build of the place (_from_disk).
 
     a = ArcticDem(dem_cache_dir, fetcher)
     got = a.tile(z, x, y, base)   # None, or (heights float32 [512, 512] above EGM2008, valid bool [512, 512])
@@ -46,6 +47,7 @@ from collections import OrderedDict
 import numpy as np
 
 import cog as cogmod
+import netfetch
 import rangeread
 
 log = logging.getLogger("earthd.arcticdem")
@@ -53,7 +55,7 @@ log = logging.getLogger("earthd.arcticdem")
 SOURCE = "arcticdem"                    # the data credits' id (credits.py) and the block cache's folder
 # What ground() makes: raise it with every change to its output. dem.py's decoded mirror and the road plans kept
 # across runs (revisit.switches_key) are keyed by it, so nothing built on an older ground is read back.
-GROUND_VERSION = 5            # 3: distant tiles moved to its level; 2: the seen ground filled (1: canopy subtracted)
+GROUND_VERSION = 8         # 3: distant tiles moved to its level; 2: the seen ground filled (1: canopy subtracted)
 RELEASE = "v4.1-2m"
 BASE = "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com/arcticdem/mosaics/v4.1/"
 FILE_URL = BASE + "2m/{folder}/{name}_2m_v4.1_dem.tif"
@@ -68,27 +70,39 @@ ORIGIN = 41                     # the supertile index of x (or y) = 0
 NODATA_LIMIT = -1000.0
 TILE = 512                      # dem.py's tile size
 LATTICE_M = 2.0                 # the mosaic's pixel: finer tile pixels are not read finer
+# The ground is read from the 4 m overview: the stereo model's own detail is ~4-8 m (its matching windows), and the
+# full 2 m level is four times the download and the decoding of a first visit, in every process making the tile
+READ_PX_M = 4.0
 MAX_LEVEL = 6                   # 2 m * 2^6 = 128 m: the coarsest overview
-TILE_CACHE_BYTES = 192 * 1024 * 1024
+TILE_CACHE_BYTES = 32 * 1024 * 1024    # decoded mosaic blocks kept (per process)
+CORNERS_FILE = "arcticdem_geoid_z10.json"   # the geoid's corners computed (beside EGM2008)
 GEOID_Z = 10                    # the geoid height's grid (its corners evaluated, bilinear between)
 CANOPY_Z = 14                   # canopy and land cover are read per z14 cell (maprasters' unit)
 # The stereo DSM is a smooth sheet over the crowns (its matching windows: ~5-10 m), the canopy model a sharp 1.2 m
 # raster with the gaps between the trees in it: smoothed to the DSM's scale before it says what is open.
 CANOPY_SMOOTH_M = 6.0           # Gaussian sigma (m)
-OPEN_CANOPY_M = 1.0             # smoothed canopy under this: open ground, the mosaic's heights are the ground's
+CANOPY_CHM = os.environ.get("BNE_ARCTIC_CHM", "0") == "1"     # Meta / WRI's canopy model instead of WorldCover's trees
+FOREST_CLASSES = (10, 95)       # WorldCover: tree cover, mangroves
+FOREST_PROXY_M = 15.0           # the canopy a WorldCover forest pixel stands for
+OPEN_CANOPY_M = 1.0            # smoothed canopy under this: open ground, the mosaic's heights are the ground's
 OPEN_EDGE_M = 4.0               # the open ground's edge (m) blended softly into the filled ground
 BUILT_CLASS = 50                # ESA WorldCover "built-up"
 BUILT_GROW_M = 20.0             # the built-up mask grown by this (WorldCover's 10 m pixels miss a building's edge)
 LOW_WINDOW_M = 30.0             # in built-up areas only the ground within LOW_M of the lowest over this window ...
 LOW_M = 1.0                     # ... counts as seen (streets and yards between houses, not their roofs)
+RAISED_M = 3.0                  # the surface this far over Mapterhorn's ground (lined up) is an object, not ground
+RAISED_GROW_M = 4.0             # ... and so is the ground this close to it (its walls' slope in the stereo model)
 FILL_SIGMAS_M = (8.0, 24.0, 72.0, 216.0)    # the fill's scales (m), finest first
 FILL_SUPPORT = 0.08             # a scale serves a pixel when this share of its neighbourhood is open ground
 SMOOTH_M = 2.0                  # the stereo model's speckle (m, Gaussian sigma) smoothed out of the result
 MAX_DIFF_M = 50.0               # a pixel this far from Mapterhorn's height is a blunder
 MARGIN = 64                     # px of the neighbouring tiles each tile is made with (cut after)
-CELL_RASTERS = 16               # z14 canopy / land-cover rasters kept (the nine tiles round one read the same few)
+WARM_WORKERS = 2                # background fetches of the mosaic at a time (per process)
+WARM_QUEUE = 64                 # tiles waiting for theirs at most (more: asked again by a later build)
+TILE_LAYERS = 16                # tiles' canopy / built-up grids kept (1 MB each at most; a tile reads its 3x3)
+CELL_RASTERS = 16              # z14 canopy / land-cover rasters kept (the nine tiles round one read the same few)
 # The distant tiles (z12-z14) keep Mapterhorn's shape but are moved to the mosaic's ground level (sparse_ground; dem.py
-# _shift_to): the near terrain stood ~5-12 m below them, a trench with a wall round it a kilometre out (2026-11-11)
+# _shift_to); otherwise the near terrain lies several metres below them, with a step where they meet
 BIAS_PX = 64                    # the grid the overview is read on ...
 BIAS_M = 32.0                   # ... from the overview with pixels this size
 OPEN_CLASSES = (20, 30, 40, 60, 90, 100)    # WorldCover: shrubs, grass, crops, bare, wetland, moss: the surface is ground
@@ -175,10 +189,40 @@ def pixel_m(z, y, size=TILE):
     return 40075016.686 * math.cos(lat) / n / size
 
 
+GAUSS_DIRECT_SIGMA = 4.0       # px: wider blurs are made on a grid shrunk to keep the kernel this wide
+
+
 def gauss(a, sigma):
-    """A separable Gaussian blur (edges held). Pure numpy."""
+    """A separable Gaussian blur (edges held). Pure numpy. A wide one (sigma over GAUSS_DIRECT_SIGMA pixels) is made on
+    the array shrunk by block means and enlarged back (bilinear): done directly, the fill's 216 m on 0.6 m pixels is a
+    kernel of thousands of taps in Python loops, about a minute a tile."""
     if sigma < 0.3:
-        return a.astype(np.float32)
+        return np.asarray(a, np.float32)
+    if sigma > GAUSS_DIRECT_SIGMA:
+        a = np.asarray(a, np.float32)
+        f = int(sigma // GAUSS_DIRECT_SIGMA)
+        h, w = a.shape
+        hh, ww = -(-h // f), -(-w // f)
+        p = np.pad(a, ((0, hh * f - h), (0, ww * f - w)), mode="edge")
+        small = p.reshape(hh, f, ww, f).mean(axis=(1, 3))
+        small = _gauss_direct(small, sigma / f)
+        # back on the full grid: a small cell's centre is at (i + 0.5) f - 0.5 full pixels
+        yy = (np.arange(h) + 0.5) / f - 0.5
+        xx = (np.arange(w) + 0.5) / f - 0.5
+        y0 = np.clip(np.floor(yy).astype(np.int64), 0, hh - 1)
+        x0 = np.clip(np.floor(xx).astype(np.int64), 0, ww - 1)
+        y1, x1 = np.minimum(y0 + 1, hh - 1), np.minimum(x0 + 1, ww - 1)
+        fy = np.clip(yy - y0, 0.0, 1.0).astype(np.float32)[:, None]
+        fx = np.clip(xx - x0, 0.0, 1.0).astype(np.float32)[None, :]
+        top = small[y0][:, x0] * (1 - fx) + small[y0][:, x1] * fx
+        bot = small[y1][:, x0] * (1 - fx) + small[y1][:, x1] * fx
+        return (top * (1 - fy) + bot * fy).astype(np.float32)
+    return _gauss_direct(a, sigma)
+
+
+def _gauss_direct(a, sigma):
+    if sigma < 0.3:
+        return np.asarray(a, np.float32)
     r = max(1, int(round(3 * sigma)))
     k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
     k = (k / k.sum()).astype(np.float32)
@@ -232,14 +276,24 @@ def min_filter(a, w):
     return out
 
 
-def seen(h, canopy, built, ok, px_m):
-    """Where the mosaic's surface is the ground: open land, and in built-up areas only its low points. Pure."""
+def seen(h, canopy, built, ok, px_m, base=None):
+    """Where the mosaic's surface is the ground: open land, in built-up areas only its low points, and nowhere it
+    stands RAISED_M over base (Mapterhorn's tile: GLO-30 with its buildings and small stands already taken out,
+    dsmground) once the two are lined up (the median offset over the rest). The last is what takes out a building wider
+    than LOW_WINDOW_M, whose flat roof is its own low point and open land too: a large shopping centre otherwise
+    stands as a hill as high as its roof. Pure."""
     s = ok & (canopy < OPEN_CANOPY_M)
     if built is not None and built.any():
         near = grow(built, BUILT_GROW_M / px_m)
         w = max(3, int(round(LOW_WINDOW_M / px_m)) | 1)
         low = (h - min_filter(np.where(ok, h, np.inf).astype(np.float32), w)) < LOW_M
         s &= ~near | low
+    if base is not None and s.any():
+        d = h - base
+        off = float(np.median(d[s]))
+        raised = ok & ((d - off) > RAISED_M)
+        if raised.any():
+            s &= ~grow(raised, RAISED_GROW_M / px_m)
     return s
 
 
@@ -247,15 +301,15 @@ def ground(h, canopy, built, ok, base, px_m):
     """The ground under surface h (above EGM2008): h itself where it is seen (seen()), elsewhere filled from the seen
     ground around (normalised convolution, the finest of FILL_SIGMAS_M with FILL_SUPPORT), past its reach base moved
     to the seen ground's level; never above h; the speckle smoothed. Pure."""
-    s = seen(h, canopy, built, ok, px_m)
+    s = seen(h, canopy, built, ok, px_m, base)
     if not s.any():
         return None
     sv = np.where(s, h, 0.0).astype(np.float32)
     sw = s.astype(np.float32)
     off = float(np.median((h - base)[s]))
     fill = (base + np.float32(off)).astype(np.float32)          # past every scale's reach: Mapterhorn's shape
-    # coarse to fine, each scale blended over the coarser ones by its support (a switch between scales was a step: a
-    # seam line through the forest, 2026-11-11)
+    # coarse to fine, each scale blended over the coarser ones by its support (a hard switch between scales leaves a
+    # step: a seam line through a forest)
     out = fill.copy()
     for sm in reversed(FILL_SIGMAS_M):
         sig = sm / max(px_m, 0.1)
@@ -274,52 +328,84 @@ def ground(h, canopy, built, ok, base, px_m):
 
 class Geoid:
     """EGM2008 geoid heights from gravity.py's model (its coefficients on disk under gravity_dir; nothing is downloaded
-    here). n(lat, lon) is None while there is no model."""
+    here), on the corners of a z10 grid. The corners computed are kept in CORNERS_FILE beside the coefficients, shared by
+    every process, and the model (~120 MB of coefficients a process) is loaded only to compute corners that are not
+    there yet, and let go right after. tile() is None while there is no model and the corners are missing."""
 
     def __init__(self, gravity_dir):
         self.dir = gravity_dir
-        self._model = None
-        self._tried = False
-        self._corners = {}
+        self._corners = None
+        self._no_model = False
         self._lock = threading.Lock()
 
-    def _get_model(self):
-        with self._lock:
-            if self._model is None and not self._tried:
-                self._tried = True
-                try:
-                    import gravity
-                    if gravity.egm2008_cached(self.dir):
-                        self._model = gravity.load_egm2008(cache_dir=self.dir, log=log.debug)
-                    else:
-                        log.info("ArcticDEM: no EGM2008 coefficients in %s: geoid from Mapterhorn offsets", self.dir)
-                except Exception as e:          # (a damaged file, no native module): the fallback
-                    log.warning("ArcticDEM: EGM2008: %s: %s", type(e).__name__, e)
-            return self._model
+    def _path(self):
+        return os.path.join(self.dir, CORNERS_FILE)
 
-    def _corner(self, cx, cy):
-        key = (cx, cy)
-        v = self._corners.get(key)
-        if v is None:
-            n = 2 ** GEOID_Z
+    def _load(self):
+        if self._corners is None:
+            self._corners = {}
+            try:
+                with open(self._path(), encoding="ascii") as f:
+                    for k, v in json.load(f).items():
+                        cx, cy = k.split(",")
+                        self._corners[(int(cx), int(cy))] = float(v)
+            except (OSError, ValueError):
+                pass
+        return self._corners
+
+    def _compute(self, missing):
+        """The missing corners from the model (loaded here, dropped after), merged into the shared file. False when
+        there is no model."""
+        if self._no_model:
+            return False
+        try:
+            import gravity
+            if not gravity.egm2008_cached(self.dir):
+                log.info("ArcticDEM: no EGM2008 coefficients in %s: geoid from Mapterhorn offsets", self.dir)
+                self._no_model = True
+                return False
+            model = gravity.load_egm2008(cache_dir=self.dir, log=log.debug)
+        except Exception as e:                  # (a damaged file, no native module): the fallback
+            log.warning("ArcticDEM: EGM2008: %s: %s", type(e).__name__, e)
+            self._no_model = True
+            return False
+        n = 2 ** GEOID_Z
+        for cx, cy in missing:
             lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * cy / n))))
             lon = cx / n * 360.0 - 180.0
-            v = float(self._model.field(lat, lon, 0.0).geoid)
-            self._corners[key] = v
-        return v
+            self._corners[(cx, cy)] = float(model.field(lat, lon, 0.0).geoid)
+        del model
+        try:                                    # (merged with what other processes wrote meanwhile)
+            path = self._path()
+            have = {}
+            try:
+                with open(path, encoding="ascii") as f:
+                    have = json.load(f)
+            except (OSError, ValueError):
+                pass
+            have.update({f"{cx},{cy}": round(v, 4) for (cx, cy), v in self._corners.items()})
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="ascii") as f:
+                json.dump(have, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except OSError as e:
+            log.debug("ArcticDEM: geoid corners not saved: %s", e)
+        return True
 
     def tile(self, z, x, y, size=TILE):
         """N (m) on tile (z, x, y)'s pixels, or None without a model."""
-        if self._get_model() is None:
-            return None
         f = 2.0 ** (GEOID_Z - z)
         i = (np.arange(size) + 0.5) / size
         gx, gy = (x + i) * f, (y + i) * f           # the pixels in z10 tile units
         x0, y0 = int(math.floor(gx.min())), int(math.floor(gy.min()))
         x1, y1 = int(math.floor(gx.max())) + 1, int(math.floor(gy.max())) + 1
+        keys = [(cx % (2 ** GEOID_Z), cy) for cy in range(y0, y1 + 1) for cx in range(x0, x1 + 1)]
         with self._lock:
-            c = np.array([[self._corner(cx % (2 ** GEOID_Z), cy) for cx in range(x0, x1 + 1)]
-                          for cy in range(y0, y1 + 1)], np.float64)
+            corners = self._load()
+            missing = [k for k in keys if k not in corners]
+            if missing and not self._compute(missing):
+                return None
+            c = np.array([corners[k] for k in keys], np.float64).reshape(y1 - y0 + 1, x1 - x0 + 1)
         u, v = gx - x0, gy - y0
         iu, iv = np.clip(np.floor(u).astype(np.int64), 0, c.shape[1] - 2), np.clip(np.floor(v).astype(np.int64), 0,
                                                                                  c.shape[0] - 2)
@@ -327,6 +413,24 @@ class Geoid:
         top = c[iv][:, iu] * (1 - fu)[None, :] + c[iv][:, iu + 1] * fu[None, :]
         bot = c[iv + 1][:, iu] * (1 - fu)[None, :] + c[iv + 1][:, iu + 1] * fu[None, :]
         return (top * (1 - fv)[:, None] + bot * fv[:, None]).astype(np.float32)
+
+
+class NotCached(netfetch.Deferred):
+    """The mosaic's bytes a tile needs are not on disk yet (they are being fetched in the background)."""
+
+
+class _DiskOnly:
+    """A fetcher that never fetches: the mosaic's reads in the build path come from the disk or raise NotCached (PGC's
+    bucket in Oregon can answer at 0.05-0.25 MB/s from Europe: a first visit waited minutes for the ground)."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def get(self, url, *a, **k):
+        raise NotCached(f"{url}: not on disk yet", url=url, host=HOST)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class ArcticDem:
@@ -339,10 +443,14 @@ class ArcticDem:
         self._rasters = rasters
         self._raw_dir = os.path.join(root, "mapdata", "raw")
         self.geoid = geoid if geoid is not None else Geoid(os.path.join(root, "gravity"))
-        self._cogs = OrderedDict()          # (name, level) -> Cog, or None
+        self._cogs = OrderedDict()          # (name, level, disk only) -> Cog, or None
+        self._disk = _DiskOnly(fetcher)     # the build path's reads: from the disk only (NotCached otherwise)
+        self._warming = set()               # tiles whose mosaic bytes are being fetched in the background
+        self._warm_pool = None
         self._lock = threading.Lock()
         self._tiles = cogmod.TileCache(TILE_CACHE_BYTES)
         self._cell_rasters = OrderedDict()
+        self._tile_layers = OrderedDict()
         self.stats = {"tiles": 0, "empty": 0, "geoid:egm2008": 0, "geoid:offset": 0, "dropped_px": 0}
 
     # --- the mosaic -------------------------------------------------------------------------------
@@ -354,14 +462,14 @@ class ArcticDem:
                     self._rasters = maprasters.Rasters(self._raw_dir, self.fetcher)
         return self._rasters
 
-    def _cog(self, name, level):
-        key = (name, level)
+    def _cog(self, name, level, disk=False):
+        key = (name, level, disk)
         with self._lock:
             if key in self._cogs:
                 self._cogs.move_to_end(key)
                 return self._cogs[key]
         remote = rangeread.RemoteFile(file_url(name), None, os.path.join(self.cache_dir, SOURCE, RELEASE, name),
-                                      self.fetcher)
+                                      self._disk if disk else self.fetcher)
         try:
             c = cogmod.Cog(remote, "demand", level=level, tiles=self._tiles)
             if c.epsg not in (None, 3413) or c.sx is None:
@@ -379,7 +487,7 @@ class ArcticDem:
                 self._cogs.popitem(last=False)
         return c
 
-    def surface(self, z, x, y, size=TILE, min_px=LATTICE_M, margin=0):
+    def surface(self, z, x, y, size=TILE, min_px=LATTICE_M, margin=0, disk=False):
         """The mosaic's heights (above the ellipsoid) and their validity on tile (z, x, y), or None where it has
         nothing. Network failures raise netfetch.FetchError."""
         if not covers(z, x, y):
@@ -401,7 +509,7 @@ class ArcticDem:
             c = None
             level = want
             while level >= 0:
-                c = self._cog(name, level)
+                c = self._cog(name, level, disk)
                 if c is not None or level == 0:
                     break
                 level -= 1
@@ -471,9 +579,44 @@ class ArcticDem:
         big = np.concatenate(rows, axis=0)
         return big[TILE - margin:2 * TILE + margin, TILE - margin:2 * TILE + margin]
 
+    def _per_tile(self, kind, fn, z, x, y):
+        """fn(z, x, y), kept for the neighbouring tiles that read it too (each tile is made with its eight neighbours'
+        margins: nine reads of each before)."""
+        key = (kind, z, x, y)
+        with self._lock:
+            if key in self._tile_layers:
+                self._tile_layers.move_to_end(key)
+                return self._tile_layers[key]
+        got = fn(z, x, y)
+        with self._lock:
+            self._tile_layers[key] = got
+            while len(self._tile_layers) > TILE_LAYERS:
+                self._tile_layers.popitem(last=False)
+        return got
+
     def canopy(self, z, x, y, size=TILE):
         """Canopy height (m, float32) on the tile's pixels (0 where none or no data), or None where no CHM file
         exists. z >= CANOPY_Z."""
+        if size == TILE:
+            return self._per_tile("canopy", lambda *k: self._canopy(*k), z, x, y)
+        return self._canopy(z, x, y, size)
+
+    def _canopy(self, z, x, y, size=TILE):
+        if not CANOPY_CHM:
+            # ESA WorldCover's tree cover as a canopy: FOREST_PROXY_M where it says trees (its 10 m pixels; the files
+            # the land cover reads anyway: 0.06 s a tile against 12 s for the canopy model's 1.2 m on a first visit,
+            # which has no overviews to read coarser); a lone clump it misses stands over Mapterhorn's ground and is
+            # taken out as raised (seen)
+            cell = self._cells(z, x, y)[0]
+            r = self._cell_raster("worldcover", cell)
+            lat, lon = tile_lat_lon(z, x, y, size)
+            cls = r.sample(lon, lat)
+            if not cls.any():
+                return None
+            return np.where(np.isin(cls, FOREST_CLASSES), FOREST_PROXY_M, 0.0).astype(np.float32)
+        return self._canopy_chm(z, x, y, size)
+
+    def _canopy_chm(self, z, x, y, size=TILE):
         cell, k, i, j = self._cells(z, x, y)
         r = self._cell_raster("canopy", cell)
         if r is None:
@@ -485,6 +628,11 @@ class ArcticDem:
 
     def built(self, z, x, y, size=TILE):
         """ESA WorldCover's built-up class on the tile's pixels (bool), or None where it has no data."""
+        if size == TILE:
+            return self._per_tile("built", lambda *k: self._built(*k), z, x, y)
+        return self._built(z, x, y, size)
+
+    def _built(self, z, x, y, size=TILE):
         cell = self._cells(z, x, y)[0]
         r = self._cell_raster("worldcover", cell)
         lat, lon = tile_lat_lon(z, x, y, size)
@@ -506,7 +654,7 @@ class ArcticDem:
         # everything on the tile with MARGIN pixels of its neighbours round it (the fill and the smoothing see across
         # its edges, so neighbouring tiles agree there: each tile alone left a line along every tile edge), cut after
         m = MARGIN
-        got = self.surface(z, x, y, margin=m)
+        got = self._from_disk(dict(z=z, x=x, y=y, margin=m, min_px=READ_PX_M))
         if got is None:
             return None
         h, ok = got
@@ -549,12 +697,42 @@ class ArcticDem:
             return None
         return np.where(ok, g, 0.0).astype(np.float32), ok
 
+    def _from_disk(self, args):
+        """surface(**args) from the bytes on disk; where some are missing, NotCached is raised and they are fetched in
+        the background (WARM_WORKERS at a time), so the next build of the place has them. The build path never waits on
+        PGC's bucket (_DiskOnly)."""
+        try:
+            return self.surface(disk=True, **args)
+        except NotCached:
+            key = tuple(sorted(args.items()))
+            with self._lock:
+                start = key not in self._warming and len(self._warming) < WARM_QUEUE
+                if start:
+                    self._warming.add(key)
+                    if self._warm_pool is None:
+                        from concurrent.futures import ThreadPoolExecutor
+                        self._warm_pool = ThreadPoolExecutor(WARM_WORKERS, thread_name_prefix="arcticdem-warm")
+            if start:
+                self._warm_pool.submit(self._warm, key, args)
+            self._count("pending")
+            raise
+
+    def _warm(self, key, args):
+        try:
+            self.surface(**args)
+            self._count("warmed")
+        except Exception as e:          # (offline, the host down: asked again by the next build that needs it)
+            log.debug("arcticdem warm %s: %s: %s", key, type(e).__name__, e)
+        finally:
+            with self._lock:
+                self._warming.discard(key)
+
     def sparse_ground(self, z, x, y, size=BIAS_PX):
         """Ground points for lining a distant tile up with the near terrain (dem.py's bias, as for HRDEM): the
         mosaic's coarse overview (BIAS_M pixels) on a size x size grid, where ESA WorldCover says open land (not trees,
         buildings or water), brought to EGM2008. (lat, lon, h) arrays, or None where there are none. Network failures
         raise netfetch.FetchError."""
-        got = self.surface(z, x, y, size=size, min_px=BIAS_M)
+        got = self._from_disk(dict(z=z, x=x, y=y, size=size, min_px=BIAS_M))
         if got is None:
             return None
         h, ok = got
