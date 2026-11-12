@@ -24,14 +24,15 @@ package.loaded['beamngEarth/places'] = {
     return true
   end }
 local dest = nil
+local routeData = { version = 7, points = { { 45.0, 7.0 }, { 45.01, 7.0 } }, dist = 1112,
+  dur = 80, elev = { { 0, 250 }, { 1112, 260 } } }
 package.loaded['beamngEarth/gps'] = {
   setDestination = function(lat, lon, name) dest = { lat = lat, lon = lon, name = name } return true end,
   setRoute = function(points) dest = { lat = points[#points].lat, lon = points[#points].lon, name = 'route' } return true end,
   clear = function() dest = nil end,
   status = function() return dest and { lat = dest.lat, lon = dest.lon, name = dest.name, remaining = 1200, eta = 90,
-    off = 3.5, routeVersion = 7 } end,
-  route = function() return dest and { version = 7, points = { { 45.0, 7.0 }, { 45.01, 7.0 } }, dist = 1112,
-    dur = 80, elev = { { 0, 250 }, { 1112, 260 } }, legs = nil } end,
+    off = 3.5, routeVersion = 7, legs = routeData.legs } end,
+  route = function() return dest and routeData end,
 }
 
 local anchor = geodesy.newAnchor(45.0, 7.0)
@@ -52,7 +53,7 @@ extensions = { hook = function(name, info) hooks[#hooks + 1] = { name, info } en
 
 local api = require('beamngEarth/api')
 
-T.check(api.version() == 1 and select(2, api.version()) == 6, 'version 1.6 (routeGeometry, transform)')
+T.check(api.version() == 1 and select(2, api.version()) == 7, 'version 1.7 (routeSteps, rebase)')
 T.check(api.has('pose') and api.has('events') and not api.has('flying'), 'features')
 T.check(api.earthVersion() == '1.8.2-beta', 'the app version from the server hello')
 
@@ -163,6 +164,21 @@ api._event('routeArrived', { lat = 3, lon = 4, name = 'Depot' })
 T.check(hooks[#hooks][1] == 'onBeamNGEarthRouteArrived' and hooks[#hooks][2].name == 'Depot', 'route arrived hook')
 api._event('waypointReached', { lat = 3, lon = 4, name = 'Charger', left = 1 })
 T.check(hooks[#hooks][1] == 'onBeamNGEarthWaypointReached' and hooks[#hooks][2].left == 1, 'waypoint reached hook')
+
+-- 1.7: the world's origin moved (core.lua says so at a rebase's end and at a teleport's commit)
+T.check(api.has('rebase') and select(2, api.version()) >= 7, 'rebase: has() and minor version 7')
+local moved = {}
+local hr = api.on('rebased', function(info) moved[#moved + 1] = info end)
+T.check(hr ~= nil, 'rebased: a listener is taken')
+api._event('rebased', { lat = 45.1, lon = 7.2, oldLat = 45.0, oldLon = 7.0, anchorId = 9, purpose = 'rebase' })
+T.check(hooks[#hooks][1] == 'onBeamNGEarthRebased' and hooks[#hooks][2].anchorId == 9, 'rebased hook')
+T.check(#moved == 1 and moved[1].oldLat == 45.0 and moved[1].lat == 45.1 and moved[1].purpose == 'rebase',
+  'rebased: the listener got the old and the new origin')
+api.off(hr)
+T.check(api.rebasing() == false, 'rebasing: not between a rebase\'s frames')
+st.rebasing = { purpose = 'rebase' }
+T.check(api.rebasing() == true, 'rebasing: between a rebase\'s two frames')
+st.rebasing = nil
 
 T.check(api.has('options') and select(2, api.version()) >= 1, 'options: has() and minor version 1')
 package.loaded['beamngEarth/addons'] = { optionValues = function(id) return id == 'x' and { port = 1 } or nil end }
@@ -276,6 +292,30 @@ r.points[1][1] = 0
 T.check(api.gpsRoute().points[1][1] == 45.0, 'a copy: the caller changes nothing')
 local g = api.gps()
 T.check(g.off == 3.5 and g.routeVersion == 7, 'gps(): off the route, its version')
+T.check(g.legs == nil and r.legs == nil, 'a route without waypoints still has no legs')
+routeData.legs = { { 400, 30 }, { 712, 50 } }
+local a, b = api.gpsRoute(), api.gps()
+a.legs[1][1] = -1
+a.legs[2] = nil
+b.legs[1][2] = -2
+b.legs[3] = { 1, 1 }
+T.check(#routeData.legs == 2 and routeData.legs[1][1] == 400 and routeData.legs[1][2] == 30
+  and routeData.legs[2][1] == 712, 'editing either API snapshot leaves the GPS legs intact')
+T.check(api.gpsRoute().legs[1][1] == 400 and api.gps().legs[1][2] == 30,
+  'subsequent API reads get the original route legs')
+r.elev[1][2] = 0
+T.check(api.gpsRoute().elev[1][2] == 250, 'elevation rows are detached too')
+T.check(api.has('routeSteps') and r.steps == nil, 'routeSteps capability, nil with an older companion')
+routeData.steps = { { type = 'roundabout', exit = 3, name = 'Main Road', leg = 1, offset = 400, distance = 712,
+  location = { lat = 45.01, lon = 7 }, lanes = { { valid = true, indications = { 'right' } } } } }
+local steps = api.gpsRoute().steps
+T.check(steps[1].exit == 3 and steps[1].location.lat == 45.01 and steps[1].lanes[1].valid,
+  'the route maneuvers, position and turn lanes')
+steps[1].location.lat = 0
+steps[1].lanes[1].indications[1] = 'left'
+steps[1].exit = 99
+T.check(routeData.steps[1].location.lat == 45.01 and routeData.steps[1].lanes[1].indications[1] == 'right'
+  and api.gpsRoute().steps[1].exit == 3, 'nested step data is detached from the GPS and other callers')
 api.gpsClear()
 local gx, gy, gz = api.toGame(45.0, 7.0)
 T.near(gx, 0, 1e-6, 'toGame: the origin x')

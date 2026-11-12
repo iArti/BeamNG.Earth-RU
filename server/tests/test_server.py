@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cdae  # noqa: E402
 import earthd  # noqa: E402
 import farpvs  # noqa: E402
+import revisitpack  # noqa: E402
 import farfield as ff  # noqa: E402
 import geodesy  # noqa: E402
 import heightmap  # noqa: E402
@@ -140,6 +141,7 @@ class ServerHarness(unittest.TestCase):
             self.server.horizon_pool.shutdown(wait=True)
         if self.server.imagery is not None:
             self.server.imagery.close()
+        revisitpack.reset()
         self.tmp.cleanup()
 
     def conn(self):
@@ -1504,7 +1506,13 @@ class MachineProfileTest(unittest.TestCase):
                 os.environ.pop("BNGE_FAST_BASE_V", None)     # (the small tier: a 6 GB test runner is a lean one)
                 earthd.machine_profile(a, True)
             self.assertEqual(a.road_processes, budget.SMALL_ROAD_PROCESSES)
-            self.assertEqual(a.workers, budget.SMALL_FAR_WORKERS)
+            # (the compact layout's one far-tile process: earthd.SMALL_COMPACT; else the small profile's)
+            self.assertEqual(a.workers, budget.LEAN_FAR_WORKERS if earthd.SMALL_COMPACT else budget.SMALL_FAR_WORKERS)
+            a = self._args()
+            with mock.patch.object(budget, "tier", return_value="small"), \
+                    mock.patch.object(earthd, "SMALL_COMPACT", False):
+                earthd.machine_profile(a, True)
+            self.assertEqual(a.workers, budget.SMALL_FAR_WORKERS, "BNGE_SMALL_COMPACT=off: the small profile's")
             if budget.SMALL_ANALYSES_OFF:
                 self.assertEqual((a.deshadow, a.colormatch), ("off", "off"))
             self.assertEqual(earthd.FAST_BASE_V, earthd.SMALL_FAST_BASE_V)
@@ -1531,7 +1539,9 @@ class MachineProfileTest(unittest.TestCase):
             a = self._args()
             with mock.patch.object(budget, "tier", return_value="small"):
                 earthd.machine_profile(a, True)
-            self.assertEqual((a.road_processes, a.workers), (budget.SMALL_ROAD_PROCESSES, budget.SMALL_FAR_WORKERS))
+            self.assertEqual((a.road_processes, a.workers),
+                             (budget.SMALL_ROAD_PROCESSES,
+                              budget.LEAN_FAR_WORKERS if earthd.SMALL_COMPACT else budget.SMALL_FAR_WORKERS))
         finally:
             earthd.FAST_BASE_V = old
 

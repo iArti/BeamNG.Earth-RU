@@ -151,6 +151,8 @@ TUNNEL_TAG = ":tun"          # in the fid of the tunnels' own plans (open sectio
 MOUTH_PLAN_M = 4.0          # m into a tunnel from a portal its floor is a grading plan too (Grader._mouth_plans)
 TUNNEL_KEEP_IN_M = 3.0      # (roads.LOW_HOLE_M: a low arch's mouths, flat at its floor)
 TUNNEL_KEEP_M = 5.0         # m beside a covered tunnel's road where the ground over it is left ungraded ...
+PORTAL_REACH_M = 30.0       # m: the cells this near a tunnel's portal grade it (apply roads_only)
+TUNNEL_OWN_MARGIN_M = 30.0  # m round a cell's box: the tunnel parts reaching into it are its plans' (_tunnel_sections)
 OVER_TUNNEL_SMALL_M = 0.5   # ... but for a change smaller than this (a road crossing over it, graded flush)
 WALL_AHEAD_M = 2.5          # ... only beside a segment or this little past its end (a joint between two: VERTEX_STEP)
 YIELD_RAMP_M = 0.5          # m over which a road gives way to another's carriageway at another level (grade_points): in
@@ -2201,6 +2203,15 @@ class _Planner:
             return []               # offline: no block waits on the same failing fetch again
         import xproc
         xproc.check_cancel()        # (a block / road tile of a place a teleport left: not planned for it)
+        deleg = getattr(self.store, "delegate", None)
+        if deleg is not None and self.shared is not None:
+            # (the server's own process: a worker process plans the cell, this thread waits for its plans and reads
+            # them below as any other process's, PlanStore.delegate; planned here as before when it could not)
+            try:
+                if not self.shared.has(key):
+                    deleg(key)
+            except Exception as e:
+                log.debug("grading: cell %s's plans not made elsewhere: %s: %s", key, type(e).__name__, e)
         shared, mine = (self.shared.claim(key) if self.shared is not None else (None, False))
         try:
             import revisit
@@ -2217,7 +2228,7 @@ class _Planner:
                     # it is planned, _elev_decked; the decks of the cells its plans read anyway, _decks_near's)
                     dg = self._cell_deck_patches(key)
                     stack = self._dg_local.__dict__.setdefault("stack", [])
-                    stack.append(self._pack_of([(ln, h, r) for _k, ln, h, r in dg]))
+                    stack.append(self._stack_entry(key, dg))
                     try:
                         got = self._make_cell(key)
                     finally:
@@ -2243,10 +2254,109 @@ class _Planner:
             self.covers.setdefault(key, covers)
             self.opens.setdefault(key, opens)
             self.dgcells.setdefault(key, dg)
+            self.__dict__.get("_road_stages", {}).pop(key, None)    # (its road stage: the plans hold it now)
+            self.__dict__.get("_road_kept", {}).pop(key, None)
             return self.cells[key]
 
     def _make_cell(self, key):
-        """(plans, keeps, covers, opens) of cell key, or None when its roads could not be fetched."""
+        """(plans, keeps, covers, opens) of cell key, or None when its roads could not be fetched: its roads' plans
+        (_road_stage) and its tunnels' (their open sections and mouths), the tunnels as the process's tunnel networks
+        solved them (_tunnel_sections), from the roads' plans alone."""
+        got = self._road_stage(key)
+        if got is None:
+            return None
+        feats, plans, keeps = got
+        plans = list(plans)
+        covers, opens = [], []
+        if feats is not None and len(feats):
+            portals = {}
+            secs = self._tunnel_sections(feats, key, portals=portals)
+            for fid, spec, xy, z, k in secs:
+                if k == 0:
+                    p = Plan(xy, z, spec.width / 2 + shoulder(spec))
+                    p.rank = grade_rank(spec)
+                    plans.append((fid + TUNNEL_TAG, p))
+            plans.extend(self._mouth_plans(secs, portals))
+            covers = [(xy, spec.width / 2 + TUNNEL_KEEP_M) for _f, spec, xy, _z, k in _twin_trimmed(secs) if k]
+            opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
+        return plans, keeps, covers, opens
+
+    ROAD_STAGES_KEPT = 48       # cells' road stages kept until their cell is planned (_road_stage)
+
+    def _road_stage(self, key):
+        """_make_cell_roads(key), made once and kept until the cell's plans are (or ROAD_STAGES_KEPT others came): the
+        cell's own planning takes it, and a tunnel network's portals in other cells are graded by it (apply with
+        roads_only, _cell_road_plans) while those cells' own plans, which need that network, are not made yet. Under the
+        cell's corrected decks (as _plan_cell plans it)."""
+        with self.lock:
+            memo = self.__dict__.setdefault("_road_stages", OrderedDict())
+            got = memo.get(key)
+            kl = self.__dict__.setdefault("_road_stage_locks", {}).setdefault(key, threading.Lock())
+        if got is not None:
+            return got
+        with kl:
+            with self.lock:
+                got = memo.get(key)
+            if got is not None:
+                return got
+            dg = self._cell_deck_patches(key)
+            stack = self._dg_local.__dict__.setdefault("stack", [])
+            stack.append(self._stack_entry(key, dg))
+            try:
+                got = self._make_cell_roads(key)
+            finally:
+                stack.pop()
+            if got is not None:
+                with self.lock:
+                    memo[key] = got
+                    while len(memo) > self.ROAD_STAGES_KEPT:
+                        memo.popitem(last=False)
+            return got
+
+    def _cell_road_plans(self, key):
+        """[(fid, Plan)] of cell key's roads alone, without its tunnels' plans (TUNNEL_TAG): the cell's plans' when they
+        are made (here, by another process: the shared cache), else its road stage's (the same plans: the tunnels' are
+        added after them). Never plans a tunnel: what a tunnel network's portals are graded by."""
+        with self.lock:
+            got = self.cells.get(key)
+        if got is None:
+            src = self._foreign(key)
+            if src is not None:
+                import geotiles
+
+                def m(xy):
+                    return geotiles.world_xy_map(src.frame, self.frame, xy)
+                return [(fid, mapped_plan(p, m)) for fid, p in src._cell_road_plans(key)]
+            with self.lock:
+                failed = self.failed.get(key)
+                staged = self.__dict__.get("_road_stages", {}).get(key)
+                read = self.__dict__.setdefault("_road_kept", OrderedDict())
+                got = read.get(key)
+            if got is not None:
+                return got
+            if staged is None and failed is not None and time.monotonic() - failed < RETRY_S:
+                return []
+            if staged is None and self.shared is not None:
+                try:
+                    kept = self.shared.load(key)
+                except Exception as e:      # (planned here then)
+                    log.debug("grading: the kept plans of %s: %s: %s", key, type(e).__name__, e)
+                    kept = None
+                if kept is not None:        # (read once: the cell's own planning takes them in later, _plan_cell)
+                    got = [(fid, p) for fid, p in kept[0] if TUNNEL_TAG not in fid]
+                    with self.lock:
+                        read[key] = got
+                        while len(read) > self.ROAD_STAGES_KEPT:
+                            read.popitem(last=False)
+                    return got
+            staged = self._road_stage(key)
+            return [] if staged is None else staged[1]
+        return [(fid, p) for fid, p in got if TUNNEL_TAG not in fid]
+
+    def _make_cell_roads(self, key):
+        """(feats, plans, keeps) of cell key: its roads (the map's), the plans of its roads on the ground (and its
+        railways' beds) within its own box and its ungraded roads' strips, or None when its roads could not be fetched.
+        Nothing of its tunnels: _make_cell."""
         widths = getattr(self, "widths", None)
         if widths is not None and hasattr(widths, "prefetch"):
             # the cell's buildings (its roads' widths) fetched while its roads are: one after the other before
@@ -2302,7 +2412,7 @@ class _Planner:
                 try:
                     self._chain_cands(key, feats, specs)        # (this cell's own: its specs are at hand)
                     ext = self._extensions(parts, ids)
-                    pins = self._pins(parts, ids, ext)
+                    pins = self._pins(parts, ids, ext, key)
                 except Exception as e:      # each part smoothed alone rather than no grading
                     log.debug("grading: road chains of %s: %s: %s", key, type(e).__name__, e)
             pclip = []
@@ -2467,30 +2577,17 @@ class _Planner:
             # every plan only within the cell's own box, so each stretch of road is planned by one cell (its dips
             # made with every road around: _lower_underpasses); the tunnels' ends graded as before, a part shorter
             # than LONG_PART_M by all of it (TunnelProfiles.ends grades them by the roads' plans alone)
-            tplans = plans
             if own is not None:
                 # (by the cell's quad in this frame, not its box: a cell at a planning region's edge stands turned
                 # ~0.16 deg in it, and boxes left slivers planned twice or not at all between neighbouring cells)
                 quad = self._clip_quad(key)
-                kept, tplans = [], []
-                for (fid, p), cl in zip(plans, pclip):
-                    pieces = trim_plan(p, own if quad is None else quad)
-                    kept.extend((fid, q) for q in pieces)
-                    tplans.extend((fid, q) for q in (pieces if cl else [p]))
+                kept = []
+                for fid, p in plans:
+                    kept.extend((fid, q) for q in trim_plan(p, own if quad is None else quad))
                 plans = kept
-            portals = {}
-            secs = self._tunnel_sections(feats, key, [p for _f, p in tplans], portals)
-            for fid, spec, xy, z, k in secs:
-                if k == 0:
-                    p = Plan(xy, z, spec.width / 2 + shoulder(spec))
-                    p.rank = grade_rank(spec)
-                    plans.append((fid + TUNNEL_TAG, p))
-            plans.extend(self._mouth_plans(secs, portals))
-            covers = [(xy, spec.width / 2 + TUNNEL_KEEP_M) for _f, spec, xy, _z, k in _twin_trimmed(secs) if k]
-            opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
         else:
-            covers, opens, keeps = [], [], []
-        return plans, keeps, covers, opens
+            keeps = []
+        return feats, plans, keeps
 
     def _chain_cands(self, key, feats=None, specs=None):
         """The graded ground parts of cell key's roads, as the continuations at a node in it are looked for (every cell
@@ -2599,7 +2696,7 @@ class _Planner:
             memo[str(key)] = (cands, arr)
         return arr
 
-    def _pins(self, parts, ids, ext):
+    def _pins(self, parts, ids, ext, cell=None):
         """plan_roads' pins of a cell's parts: an end that no part of its own smoothing goes on from (ext None there) and
         that ends on another road's part smoothed as much or more (a slip road on a motorway, a side road on a trunk or
         on a street of its own class) is held at that road's planned height there (_stronger_z), so the two meet at one
@@ -2644,44 +2741,68 @@ class _Planner:
                         best = (c, bool(int(h) % 2))
                 if best is not None:
                     todo.append((j, end, best[0], best[1]))
-        for (j, end, _c, _l), z in zip(todo, self._stronger_zs([(c, last) for _j, _e, c, last in todo])):
+        for (j, end, _c, _l), z in zip(todo, self._stronger_zs([(c, last) for _j, _e, c, last in todo], cell)):
             if z is not None:
                 out[j][end] = z
                 held = True
         return [tuple(o) for o in out] if held else None
 
-    def _stronger_zs(self, asks):
-        """_stronger_z of each (candidate, at_last) of asks, the ones not kept yet planned in one plan_roads call (the
-        same plans: each part is planned on its own; its cost is per call, ~1 ms, 935 calls in 4 Penn Station cells,
-        2026-10-25)."""
+    def _stronger_zs(self, asks, cell=None):
+        """_stronger_z of each (candidate, at_last) of asks for the plans of cell (the one being planned), the ones not
+        kept yet planned in one plan_roads call per context (the same plans: each part is planned on its own; its cost
+        is per call, ~1 ms, 935 calls in 4 Penn Station cells, 2026-10-25). Each answer a function of the candidate, its
+        end and the cell (_strong_key, _strong_args): one call for all of them planned every part in the first one's
+        context, and a memo by road id and end answered with whichever cell's copy of the road, in whichever cell's
+        context, had asked first: a cell's plans depended on which cells the process had planned before it (Fells Point,
+        2026-11-12)."""
         memo = self.__dict__.setdefault("_strong_memo", {})
-        keys = [self._strong_key(c, last) for c, last in asks]
+        keys = [self._strong_key(c, last, cell) for c, last in asks]
         with self.lock:
             miss = [n for n, k in enumerate(keys) if k not in memo]
-        jobs, seen = [], set()
+        groups, seen = {}, set()
         for n in miss:
             if keys[n] not in seen:
                 seen.add(keys[n])
-                jobs.append(n)
-        if len(jobs) > 1:
+                prep = self._strong_part(*asks[n])
+                ctx = None if hasattr(cell, "bounds") else self._strong_ctx(prep[0])
+                groups.setdefault(ctx, []).append((n, prep))
+        for jobs in groups.values():
+            if len(jobs) < 2:
+                continue            # (_stronger_z below)
             try:
-                preps = [self._strong_part(*asks[n]) for n in jobs]
-                parts = [(part, asks[n][0][4]) for n, (part, _last, _whole) in zip(jobs, preps)]
-                ext = self._extensions(parts, [asks[n][0][5] for n in jobs])
+                parts = [(part, asks[n][0][4]) for n, (part, _last, _whole) in jobs]
+                ext = self._extensions(parts, [asks[n][0][5] for n, _p in jobs])
                 plans = plan_roads(self.frame, parts, self.elev, None, ext, cuts=False,
-                                   coarse=COARSE_EASE_ON and self._coarse_ll(parts[0][0]),
-                                   obs=self._obs(None, parts[0][0]), decks=self._decks_ll(parts[0][0]))
-                for n, (part, last, whole), p in zip(jobs, preps, plans):
+                                   **self._strong_args(cell, parts[0][0]))
+                for (n, (part, last, whole)), p in zip(jobs, plans):
                     self._strong_keep(asks[n][0], keys[n], p, last, whole)
             except Exception as e:      # one at a time, each its own failure (_stronger_z)
                 log.debug("grading: pin heights at once: %s: %s", type(e).__name__, e)
-        return [self._stronger_z(c, last) for c, last in asks]
+        return [self._stronger_z(c, last, cell) for c, last in asks]
+
+    def _strong_args(self, cell, part):
+        """plan_roads' coarse / obs / decks for a _stronger_z plan of lon/lat part: the cell being planned's, as its own
+        plans' (_make_cell_roads), or without a cell the part's own (its middle's cell)."""
+        if hasattr(cell, "bounds"):
+            return {"coarse": COARSE_EASE_ON and self._coarse(cell), "obs": self._obs(cell),
+                    "decks": self._decks_near(cell)}
+        return {"coarse": COARSE_EASE_ON and self._coarse_ll(part), "obs": self._obs(None, part),
+                "decks": self._decks_ll(part)}
+
+    def _strong_ctx(self, part):
+        """_strong_args' context of a part without a cell: its coarse elevation (and so its measured heights, _obs) and
+        its middle's cell (its decks, _decks_ll). Parts of one context are planned in one call."""
+        mid = np.asarray(part, np.float64)[len(part) // 2] if len(part) else None
+        return (bool(COARSE_EASE_ON and self._coarse_ll(part)),
+                None if mid is None else str(mapcells.cell_of(float(mid[1]), float(mid[0]))))
 
     @staticmethod
-    def _strong_key(cand, at_last):
-        xy, rid = cand[0], cand[2]
-        e = xy[-1 if at_last else 0]
-        return (rid, round(float(e[0]), 1), round(float(e[1]), 1))
+    def _strong_key(cand, at_last, cell=None):
+        """_stronger_z's memo key: the cell being planned (its context: _strong_args), the candidate's road, its own
+        geometry (each cell's copy of a road lies ~1e-5 m from the others': not one road id's) and its end."""
+        import hashlib
+        xy = np.ascontiguousarray(cand[0], np.float64)
+        return (str(cell), cand[2], hashlib.blake2b(xy.tobytes(), digest_size=16).digest(), bool(at_last))
 
     def _strong_part(self, cand, at_last):
         """(the lon/lat part planned for _stronger_z, whose end is asked for: its last point?, the whole part?)"""
@@ -2703,10 +2824,8 @@ class _Planner:
         z, other = None, None
         if p is not None:
             z = float(p.z[-1] if at_last else p.z[0])
-            if whole:
-                xy, rid = cand[0], cand[2]
-                e2 = xy[0 if at_last else -1]
-                other = ((rid, round(float(e2[0]), 1), round(float(e2[1]), 1)), float(p.z[0] if at_last else p.z[-1]))
+            if whole:           # (k's own last flag is the part's end asked: at_last may be the run's, _strong_part)
+                other = (k[:3] + (not k[3],), float(p.z[0] if at_last else p.z[-1]))
         memo = self.__dict__.setdefault("_strong_memo", {})
         with self.lock:
             if len(memo) > 4096:
@@ -2715,11 +2834,11 @@ class _Planner:
             if other is not None:
                 memo.setdefault(*other)
 
-    def _stronger_z(self, cand, at_last):
+    def _stronger_z(self, cand, at_last, cell=None):
         """The planned height of a candidate part (_chain_cands') at its first or last point: its own plan (its chains,
-        no pins), within CLIP_MARGIN_M of that point when it is long. Kept per part end (a short part's plan gives both
-        ends' heights: the other kept too)."""
-        k = self._strong_key(cand, at_last)
+        no pins), within CLIP_MARGIN_M of that point when it is long, for the plans of cell. Kept per part end and cell
+        (_strong_key; a short part's plan gives both ends' heights: the other kept too)."""
+        k = self._strong_key(cand, at_last, cell)
         memo = self.__dict__.setdefault("_strong_memo", {})
         with self.lock:
             if k in memo:
@@ -2729,8 +2848,7 @@ class _Planner:
             # (the profile alone: its cutting's walls cost most of a plan and no height, 2026-10-25)
             p = plan_roads(self.frame, [(part, cand[4])], self.elev, None,
                            self._extensions([(part, cand[4])], [cand[5]]), cuts=False,
-                           coarse=COARSE_EASE_ON and self._coarse_ll(part), obs=self._obs(None, part),
-                           decks=self._decks_ll(part))[0]
+                           **self._strong_args(cell, part))[0]
             self._strong_keep(cand, k, p, last, whole)
         except Exception as e:      # not held rather than no grading
             log.debug("grading: pin height of %s: %s: %s", cand[5], type(e).__name__, e)
@@ -4650,33 +4768,41 @@ class _Planner:
         revisit.carry(sum(n for n, _ in got), sum(m for _, m in got))
 
     def _decks_in(self, keys):
-        """({key: (line, half width)} of the decks of cells keys, each once; whether a cell was missing)."""
+        """({key: (line, half width)} of the decks of cells keys, each once (the first cell's copy); whether a cell was
+        missing)."""
         out, short = {}, False
         if ENU_AHEAD_ON:
             self._enu_ahead(keys)
         for k in keys:
-            with self.lock:
-                failed = self.failed.get(k)
-            if failed is not None and time.monotonic() - failed < RETRY_S:
-                short = True            # (its road data failed: asked again after RETRY_S, as its plans are)
-                continue
-            try:
-                c = self._cell_enu(k, ground=False)
-            except Exception as e:      # (that cell's decks left out; nothing kept)
-                log.debug("grading: deck ground of %s: %s: %s", k, type(e).__name__, e)
-                with self.lock:
-                    self.failed[k] = time.monotonic()
+            rows = self._deck_rows_of(k)
+            if rows is None:
                 short = True
                 continue
-            rm = self.__dict__.setdefault("_dg_rows", {})
-            got = rm.get(str(k))
-            if got is None or got[0] is not c:      # (made once per cell's parts)
-                got = rm[str(k)] = (c, self._deck_rows(c))
-                if len(rm) > 2 * ENU_CACHE_MAX:
-                    rm.clear()
-            for key, line, half in got[1]:
+            for key, line, half in rows:
                 out.setdefault(key, (line, half))
         return out, short
+
+    def _deck_rows_of(self, k):
+        """_deck_rows of cell k (made once per cell's parts), or None when its road data could not be read (asked
+        again after RETRY_S, as its plans are)."""
+        with self.lock:
+            failed = self.failed.get(k)
+        if failed is not None and time.monotonic() - failed < RETRY_S:
+            return None
+        try:
+            c = self._cell_enu(k, ground=False)
+        except Exception as e:      # (that cell's decks left out; nothing kept)
+            log.debug("grading: deck ground of %s: %s: %s", k, type(e).__name__, e)
+            with self.lock:
+                self.failed[k] = time.monotonic()
+            return None
+        rm = self.__dict__.setdefault("_dg_rows", {})
+        got = rm.get(str(k))
+        if got is None or got[0] is not c:      # (made once per cell's parts)
+            got = rm[str(k)] = (c, self._deck_rows(c))
+            if len(rm) > 2 * ENU_CACHE_MAX:
+                rm.clear()
+        return got[1]
 
     def _cells_round(self, lat, lon, reach):
         """The map cells within reach m of the points (as _keys)."""
@@ -4687,24 +4813,42 @@ class _Planner:
             keys = mapcells.cells_near_points(lat, lon, pad, padlon)
         return keys
 
+    def _home_copies(self, keys, decks):
+        """[(line, half width)] of the decks keys of decks {key: (line, half)}: each its home cell's copy (the cell holding
+        its first point, one of the cells it lies in, which its patch reads anyway), else the one given. Every cell
+        decodes its own copy of a road (~1e-5 m from the others'), and a deck's correction (kept per deck) was made from
+        the copy of whichever cell asked first: plans depended on the order cells were planned in (2026-11-12)."""
+        firsts = np.array([decks[k][0][0] for k in keys], np.float64).reshape(-1, 2)
+        la, lo, _ = self.frame.enu_to_geodetic(firsts[:, 0], firsts[:, 1], 0.0)
+        homes = mapcells.cells_of(np.asarray(la, np.float64), np.asarray(lo, np.float64))
+        out = []
+        for k, home in zip(keys, homes):
+            rows = self._deck_rows_of(home)
+            out.append(next(((ln, h) for kk, ln, h in rows or () if kk == k), decks[k]))
+        return out
+
     def _deck_patches(self, decks):
         """{key: patch or None} of decks {key: (line, half width)}: a patch (line, half, rows (m, 6): station arc, ground
         left, ground right, foot left, foot right, weight) where the elevation holds a bridge under the deck, else None.
         Each deck's own (its samples and the decks round it within DECK_GROUND_REACH_M, whatever cell asks), made once;
         the missing ones in one probe."""
         memo = self.__dict__.setdefault("_dg_memo", OrderedDict())
+        short_memo = self.__dict__.setdefault("_dg_short", {})     # key -> (monotonic time, patch): made short
         out, todo = {}, []
+        now = time.monotonic()
         with self.lock:
             for k in decks:
                 if k in memo:
                     memo.move_to_end(k)
                     out[k] = memo[k]
+                elif k in short_memo and now - short_memo[k][0] < RETRY_S:
+                    out[k] = short_memo[k][1]
                 else:
                     todo.append(k)
         if not todo:
             return out
         import fast
-        lines = [decks[k] for k in todo]
+        lines = self._home_copies(todo, decks)
         # each deck's neighbours (the decks of the cells it lies in: no cells read past them): their footprints are
         # left out of its side samples
         masks, mask_of, mindex, keep, by_cells = [], [], {}, [], {}
@@ -4716,10 +4860,12 @@ class _Planner:
                 near, short = self._decks_in(cells)
                 items = sorted(near.items())
                 for mk, (ml, mh) in items:
-                    if mk not in mindex:
-                        mindex[mk] = len(masks)
+                    # (per cell set: another set's copy of a neighbour deck is another cell's, and a deck's patch then
+                    # depended on the decks patched with it)
+                    if (cells, mk) not in mindex:
+                        mindex[(cells, mk)] = len(masks)
                         masks.append((ml, mh))
-                idx = np.array([mindex[mk] for mk, _v in items], np.int64)
+                idx = np.array([mindex[(cells, mk)] for mk, _v in items], np.int64)
                 bx = np.array([(*ml.min(0) - mh, *ml.max(0) + mh) for _mk, (ml, mh) in items],
                               np.float64).reshape(-1, 4)
                 got = by_cells[cells] = (idx, bx, short)
@@ -4752,10 +4898,14 @@ class _Planner:
                 got[k] = None
         with self.lock:
             for k, ok in zip(todo, keep):
-                if ok:              # (a neighbour cell missing: asked again)
+                if ok:
                     memo[k] = got[k]
+                else:               # (a neighbour cell missing: made again after RETRY_S, as the cell is asked again)
+                    short_memo[k] = (now, got[k])
             while len(memo) > DECK_GROUND_KEPT:
                 memo.popitem(last=False)
+            if len(short_memo) > DECK_GROUND_KEPT:
+                short_memo.clear()
         out.update(got)
         return out
 
@@ -4829,46 +4979,133 @@ class _Planner:
                     memo.popitem(last=False)
         return pack
 
+    def _stack_entry(self, key, dg):
+        """What the elevation reads while cell key is planned (_deck_ground): its corrected decks dg
+        (_cell_deck_patches) as a pack, and its bounds (lon0, lat0, lon1, lat1): the points they hold every deck of."""
+        return self._pack_of([(ln, h, r) for _k, ln, h, r in dg]), (key.bounds() if hasattr(key, "bounds") else None)
+
     def _deck_ground(self, lat, lon, z, e=None, n=None, keys=None):
         """z (n,) at points (lat, lon) (frame ENU e, n when at hand) with the bridges the elevation holds under mapped
         decks taken out (DECK_GROUND_*): z itself when nothing changes. keys: the planned cells round the points whose
-        kept corrections are used (apply); None: the cell this thread is planning's, else the planned cells' the points
-        lie in (the plans' own elevation: never a cell read for it). Pure in the map and the elevation (each point's
-        decks are those within DECK_GROUND_REACH_M of it, whatever else is asked with it: every one of them is kept
-        with the plans of the point's own cell)."""
+        kept corrections are used (apply); None: the cell this thread is planning's for its own points and the decks
+        round the others (_near_pack), else the planned cells' the points lie in (the plans' own elevation: never a cell
+        read for it). Pure in the map and the elevation (each point's decks are those within DECK_GROUND_REACH_M of it,
+        whatever else is asked with it: every one of them is kept with the plans of the point's own cell). A point past
+        the cell being planned read that cell's decks alone, and a height kept per point (railways' ground, the rail
+        nodes, the abutments') was the first planned cell's: plans depended on the order cells were planned in
+        (2026-11-12)."""
         if not DECK_GROUND_ON or not len(z):
             return z
         try:
+            past = None
             if keys is None:
                 stack = self._dg_local.__dict__.get("stack")
                 if stack:
-                    pack = stack[-1]
+                    pack, bounds = stack[-1]
+                    if bounds is not None:
+                        lon0, lat0, lon1, lat1 = (float(v) for v in bounds)
+                        past = ~((lat >= lat0) & (lat <= lat1) & (lon >= lon0) & (lon <= lon1))
+                        if not past.any():
+                            past = None
                 else:
                     keys = self._planned_keys(self._cells_round(lat, lon, 0.0))
                     pack = self._deck_pack_cells(keys) if keys else None
             else:
                 pack = self._deck_pack_cells(keys)
-            if pack is None:
-                return z
-            box = pack[0]
-            inside = (lat >= box[0]) & (lat <= box[2]) & (lon >= box[1]) & (lon <= box[3])
-            if not inside.any():
-                return z
-            if e is None:
-                ei, ni, _ = self.frame.geodetic_to_enu(lat[inside], lon[inside], 0.0)
-            else:
-                ei, ni = e[inside], n[inside]
-            import fast
-            got = fast.deck_ground_apply(ei, ni, np.asarray(z, np.float64)[inside], *pack[1:], DECK_GROUND_BLEND_M,
-                                         DECK_GROUND_END_M)
+            out = self._apply_pack(pack, lat, lon, z, e, n, None if past is None else ~past)
+            if past is not None:
+                zp = np.asarray(out, np.float64)[past]
+                got = self._apply_pack(self._near_pack(lat[past], lon[past]), lat[past], lon[past], zp,
+                                       None if e is None else e[past], None if n is None else n[past])
+                if got is not zp:
+                    out = np.array(out, np.float64, copy=True)
+                    out[past] = got
+            return out
         except Exception as ex:     # (the elevation as it is rather than none)
             log.debug("grading: deck ground: %s: %s", type(ex).__name__, ex)
             return z
+
+    def _apply_pack(self, pack, lat, lon, z, e=None, n=None, which=None):
+        """z lowered under the decks of pack (_pack_of) at the points (lat, lon) (which: only those), or z itself."""
+        if pack is None:
+            return z
+        box = pack[0]
+        inside = (lat >= box[0]) & (lat <= box[2]) & (lon >= box[1]) & (lon <= box[3])
+        if which is not None:
+            inside &= which
+        if not inside.any():
+            return z
+        if e is None:
+            ei, ni, _ = self.frame.geodetic_to_enu(lat[inside], lon[inside], 0.0)
+        else:
+            ei, ni = e[inside], n[inside]
+        import fast
+        got = fast.deck_ground_apply(ei, ni, np.asarray(z, np.float64)[inside], *pack[1:], DECK_GROUND_BLEND_M,
+                                     DECK_GROUND_END_M)
         if got is None:
             return z
         out = np.array(z, np.float64, copy=True)
         out[inside] = got
         return out
+
+    def _near_pack(self, lat, lon):
+        """_pack_of the corrected decks that can reach any of the points (lat, lon): every deck within
+        DECK_GROUND_REACH_M + END + BLEND of them, from the cells round them (_cell_deck_patches' rule round a cell), or
+        None. Kept per deck set."""
+        r = DECK_GROUND_REACH_M + DECK_GROUND_END_M + DECK_GROUND_BLEND_M
+        pad = r / 111320.0          # (the cells within r of each point, not of their box: no cells read for nothing)
+        cells = mapcells.cells_near_points(lat, lon, pad, pad / max(0.05, math.cos(math.radians(float(np.mean(lat))))))
+        keys, lines, boxes = self._near_decks(cells)
+        if not keys:
+            return None
+        e, n, _ = self.frame.geodetic_to_enu(lat, lon, 0.0)
+        e, n = np.asarray(e, np.float64), np.asarray(n, np.float64)
+        hit = np.flatnonzero((boxes[:, 2] >= e.min() - r) & (boxes[:, 3] >= n.min() - r) & (boxes[:, 0] <= e.max() + r)
+                             & (boxes[:, 1] <= n.max() + r))
+        if len(hit) and len(e) > 1:     # (a deck within r of one of the points, not only of their box)
+            b = boxes[hit]
+            near = ((e[None, :] >= b[:, :1] - r) & (e[None, :] <= b[:, 2:3] + r) & (n[None, :] >= b[:, 1:2] - r)
+                    & (n[None, :] <= b[:, 3:4] + r)).any(axis=1)
+            hit = hit[near]
+        if not len(hit):
+            return None
+        mk = tuple(sorted(keys[i] for i in hit))
+        memo = self.__dict__.setdefault("_dg_near_packs", OrderedDict())
+        with self.lock:
+            got = memo.get(mk)
+            if got is not None and (got[1] is None or time.monotonic() - got[1] < RETRY_S):
+                memo.move_to_end(mk)
+                return got[0]
+        patches = self._deck_patches({keys[i]: lines[i] for i in hit})
+        act = [p for _k, p in sorted(patches.items()) if p is not None]
+        pack = self._pack_of(act) if act else None
+        dm = self.__dict__.get("_dg_memo", {})
+        with self.lock:
+            # (made from a missing cell's neighbours: made again after RETRY_S, as _deck_patches does)
+            memo[mk] = (pack, None if all(k in dm for k in mk) else time.monotonic())
+            while len(memo) > DECK_GROUND_PACKS_KEPT:
+                memo.popitem(last=False)
+        return pack
+
+    def _near_decks(self, keys):
+        """(deck keys, [(line, half width)], boxes (n, 4): min e, min n, max e, max n) of the decks of cells keys
+        (_decks_in), kept per cell set while every cell was read (_near_pack asks for the same few sets all along)."""
+        mk = tuple(str(k) for k in keys)
+        memo = self.__dict__.setdefault("_dg_near_cells", OrderedDict())
+        with self.lock:
+            if mk in memo:
+                memo.move_to_end(mk)
+                return memo[mk]
+        decks, short = self._decks_in(keys)
+        ks = list(decks)
+        got = (ks, [decks[k] for k in ks],
+               np.array([(*decks[k][0].min(0), *decks[k][0].max(0)) for k in ks], np.float64).reshape(-1, 4))
+        if not short:
+            with self.lock:
+                memo[mk] = got
+                while len(memo) > DECK_GROUND_PACKS_KEPT:
+                    memo.popitem(last=False)
+        return got
 
     def _elev_decked(self, la, lo):
         """self.elev: elev_raw with the bridges it holds under mapped decks taken out (_deck_ground)."""
@@ -5362,30 +5599,6 @@ class _Planner:
             log.debug("grading: water lift: %s: %s", type(e).__name__, e)
             return 0.0
 
-    def _longest(self, fid, j, ring, key):
-        """Part j (its roads.part_keys key) of tunnel fid as the cells at its ends have it, the longest (a part comes clipped differently in
-        the cells around: graded as the 30 m piece, 97th Street's 45 m arch got an open road graded in it; the
-        same rule as roads.BridgeProfiles._load, 2026-10-17)."""
-        best = ring
-        for p in (ring[0], ring[-1]):
-            ck = mapcells.cell_of(float(p[1]), float(p[0]))
-            if key is not None and str(ck) == str(key):
-                continue
-            try:
-                f = self.md.cell(ck, layers=("roads",), kind="demand").layers.get("roads")
-            except Exception:
-                continue
-            if f is None or not len(f):
-                continue
-            ids = [str(x) for x in f.ids]
-            if fid not in ids:
-                continue
-            i = ids.index(fid)
-            got = dict(roadsmod._keyed(roadsmod.TunnelProfiles.keys_of, roadsmod.tunnel_parts, f, i)).get(j)
-            if got is not None and len(got) > len(best):
-                best = got
-        return best
-
     def _chains_for(self):
         """A roads.TunnelProfiles of this frame for its chain questions (drowned): the same chains, from the same map
         cells, as the road tiles' and terrain blocks' own."""
@@ -5398,184 +5611,106 @@ class _Planner:
             self._chains = t
         return self._chains
 
-    def _tunnel_pins(self, key, ring):
-        """roads.TunnelProfiles.part_pins for tunnel part key (geodetic floor heights of its ends inside the hill, NaN
-        at a portal; None: none): the process's tunnel chain store's when it is there, else this frame's own; both
-        solve the chain on the same raw ground."""
-        if not roadsmod.CHAIN_PINS:
-            return None
-        get = getattr(self.store, "tunnel_store", None) if getattr(self, "store", None) is not None else None
-        cs = get() if callable(get) else None
-        if cs is not None:
-            try:
-                st = cs.store_at(float(ring[0][1]), float(ring[0][0]))
-                if st.raw is not None:
-                    return st.part_pins(key, ring)
-            except Exception as e:      # (this frame's own then)
-                log.debug("grading: the chain store's pins: %s: %s", type(e).__name__, e)
-        try:
-            return self._chains_for().part_pins(key, ring)
-        except Exception as e:          # (the part's own ends, as before)
-            log.debug("grading: tunnel pins: %s: %s", type(e).__name__, e)
-            return None
+    def _roads_ground(self, la, lo, base):
+        """base (the ground at the points) graded by the roads' plans alone (apply with roads_only, by the points'
+        planning regions): the ground a tunnel's portals stand on. Never plans a tunnel (_cell_road_plans). Each point
+        on its own: a part's two portals asked together took in every cell of the box between them, whose roads reach
+        neither (three more cells' road stages for four Fells Point cells, +44 % of their planning, 2026-11-12)."""
+        la = np.asarray(la, np.float64)
+        lo = np.asarray(lo, np.float64)
+        base = np.asarray(base, np.float64)
+        if base.size == 0:
+            return base
+        la_, lo_, b = la.ravel(), lo.ravel(), base.ravel()
+        out = np.array(b, np.float64, copy=True)
+        for q in range(len(b)):
+            pl = self if self.store is None else self.store.planners_of(la_[q:q + 1], lo_[q:q + 1])[0][0]
+            out[q] = pl.apply(la_[q:q + 1], lo_[q:q + 1], b[q:q + 1], ROAD_LIFT, roads_only=True)[0]
+        return out.reshape(base.shape)
 
-    def _drowned(self, key, ring):
-        """roads.TunnelProfiles.drowned for tunnel part key (ring: its lon / lat points): the process's tunnel chain
-        store's (the road tiles' and blocks', blockworker: store.tunnel_store), whose chains are resolved once for all
-        of them, when it is there; else this frame's own (_chains_for)."""
-        get = getattr(self.store, "tunnel_store", None) if getattr(self, "store", None) is not None else None
-        cs = get() if callable(get) else None
-        if cs is not None:
-            try:
-                st = cs.store_at(float(ring[0][1]), float(ring[0][0]))
-                if st.wet is not None:
-                    return st.drowned(key, ring)
-            except Exception as e:      # (this frame's own then)
-                log.debug("grading: the chain store's drowned: %s: %s", type(e).__name__, e)
-        return self._chains_for().drowned(key, ring)
-
-    def _subsea_part(self, feats, i, j, ring, portals):
-        """The canonical region's solved wet profile, including its dry approaches. None: ordinary tunnel rules.
-
-        The grading reader uses the same raw source, region frame and native solve as the mesh reader. It never
-        calls a grader from a profile endpoint: planning the tunnel must not recursively plan itself.
-        """
-        import geotiles
+    def _tunnel_chains(self):
+        """The tunnel networks of this process's plans (a roads.ChainStore of roads.TunnelProfiles, one for the
+        PlanStore's every region): the same solve as the road tiles' and the terrain blocks' stores, on the same raw
+        ground (tunnel_raw), its portals on the ground the roads' plans alone grade (_roads_ground): the grading takes a
+        tunnel's floor and sections from it instead of working them out again from its own cell's copy of the part
+        (2026-11-12: I-395's ramps under Washington, a 1.4 m step in the ground where the store and the grading had
+        read one network from different cells; Porte Maillot's ramp, a tube in the meshes and an open cut in the
+        ground, 6 m apart)."""
         holder = self.store if self.store is not None else self
         with holder.lock:
-            cs = getattr(holder, "_subsea_chains", None)
-            if cs is None:
-                raw = self.tunnel_raw or self.elev
-                md, wet, water = self.md, self.wet, self.water
-                def setup(t):
-                    t.wet, t.water, t.raw = wet, water, raw
-                cs = holder._subsea_chains = roadsmod.ChainStore(roadsmod.TunnelProfiles,
-                    lambda k: md.cell(k, layers=("roads",), kind="demand").layers.get("roads"), raw, setup)
-        st = cs.store_at(float(ring[0][1]), float(ring[0][0]))
-        k = (str(feats.ids[i]), j)
-        if not st.drowned(k, ring):
-            return None
-        whole = roadsmod.BridgeProfiles.parts_todo(st, [(k, feats, i)])
-        pid = st._part_id(k)
-        with st.lock:
-            supported = pid in st._subsea
-            secs = list(st.sections.get(pid, ()))
-        if not supported:
-            return []
-        out = []
-        for _pid, spec, xy, z, _lon in whole:
-            la, lo, h = geotiles.world_to_geodetic(st.frame, np.c_[xy, z])
-            e, n, _ = self.frame.geodetic_to_enu(la, lo, 0.)
-            xy = np.c_[e, n]
-            for index, (a, b, kind) in enumerate(secs):
-                if b <= a: continue
-                fid = f"{pid}#{index}"
-                # Plans are the terrain datum: apply(..., ROAD_LIFT) supplies the physical road surface.
-                # The native tunnel profile already IS that surface, so do not add the lift a second time.
-                out.append((fid, spec, xy[a:b + 1], np.asarray(h)[a:b + 1] - ROAD_LIFT, kind))
-                if kind and portals is not None:
-                    for at, is_mouth in zip((a, b), st.mouth(fid)):
-                        portals[(fid, tuple(np.round(xy[at], 3)))] = is_mouth
-        return out
+            cs = holder.__dict__.get("_tunnel_cs")
+        if cs is not None:
+            return cs
+        raw = self.tunnel_raw or self.elev
+        md, wet, water = self.md, self.wet, self.water
+
+        def ends(la, lo):
+            return self._roads_ground(la, lo, raw(la, lo))
+
+        def setup(t):
+            t.wet, t.water, t.raw, t.ends = wet, water, raw, ends
+        cs = roadsmod.ChainStore(roadsmod.TunnelProfiles,
+                                 lambda k: md.cell(k, layers=("roads",), kind="demand").layers.get("roads"), ends, setup)
+        with holder.lock:
+            return holder.__dict__.setdefault("_tunnel_cs", cs)
 
     def _tunnel_sections(self, feats, key=None, road_plans=(), portals=None):
-        """[(fid, spec, xy, z, kind)] of the tunnels' sections (roads.tunnel_sections on the ungraded ground, its
-        ends graded by road_plans: the cell's road Plans, as roads.TunnelProfiles.ends grades them with the roads'
-        plans alone): kind 0 an open road at z, 1 a low arch, 2 a full tunnel."""
+        """[(fid, spec, xy, z, kind)] of the tunnels' sections, as the tunnel networks have them (_tunnel_chains: the
+        floor and the sections the road tiles draw and the terrain blocks cut their holes for): kind 0 an open road at
+        z, 1 a low arch, 2 a full tunnel; z the plans' (the terrain's datum: the floor less ROAD_LIFT, which apply
+        adds). portals ({(fid, an end's xy rounded): is a portal}): filled for the covered sections' ends
+        (_mouth_plans). A part left out by the networks (under water, GitHub #128) has none."""
+        import geotiles
+        import pools
         out = []
         ts = roadsmod.tunnel_specs(feats)
-        pack = None                     # (the road plans packed once: per tunnel part, ~6 ms each, 0.9 s of 8 tiles)
-        over = None                     # (the ground roads near the tunnels, as roads.TunnelProfiles covers them)
+        cs = None
+        own = self._clip_box(key, TUNNEL_OWN_MARGIN_M) if key is not None else None
         for i in range(len(feats)):
             if ts[i] is None:
                 continue
+            fid = str(feats.ids[i])
             for j, ring in roadsmod._keyed(roadsmod.TunnelProfiles.keys_of, roadsmod.tunnel_parts, feats, i):
-                ring = self._longest(str(feats.ids[i]), j, ring, key)
-                ll = np.asarray(ring, np.float64)
-                if len(ll) < 2:
+                if len(ring) < 2:
                     continue
-                if self.water is not None:
-                    solved = self._subsea_part(feats, i, j, ring, portals)
-                    if solved is not None:
-                        out.extend(solved)
+                if own is not None:
+                    # (a part wholly outside the cell's own box is the plans' of the cells it lies in: solved here too,
+                    # its portals' cells' road stages were planned for a cell that never grades them, +44 % of four
+                    # Fells Point cells' planning, 2026-11-12)
+                    r = np.asarray(ring, np.float64)
+                    e_, n_, _ = self.frame.geodetic_to_enu(r[:, 1], r[:, 0], 0.0)
+                    e_, n_ = np.asarray(e_), np.asarray(n_)
+                    if e_.max() < own[0] or e_.min() > own[2] or n_.max() < own[1] or n_.min() > own[3]:
                         continue
-                E, N, _ = self.frame.geodetic_to_enu(ll[:, 1], ll[:, 0], 0.0)
-                xy, s = resample(np.stack([np.asarray(E), np.asarray(N)], axis=1), VERTEX_STEP)
-                if len(xy) < 2 or s[-1] <= 0:
+                cs = self._tunnel_chains() if cs is None else cs
+                k = (fid, j)
+                try:
+                    st = cs.store_at(float(ring[0][1]), float(ring[0][0]))
+                    whole = roadsmod.BridgeProfiles.parts_todo(st, [(k, feats, i)])
+                    subs = st._closed_of(whole) + st._open_of(whole)
+                    with st.lock:
+                        secs = list(st.sections.get(st._part_id(k), ()))
+                except pools.Abandoned:
+                    raise
+                except Exception as e:      # (no plans for this tunnel rather than none for the cell)
+                    log.debug("grading: tunnel %s: %s: %s", k, type(e).__name__, e)
                     continue
-                la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
-                if self.wet is not None and \
-                        (np.asarray(self.wet(la, lo)) > 0.5).mean() > roadsmod.TUNNEL_WET_SHARE:
-                    continue
-                if self.wet is not None and self._drowned((str(feats.ids[i]), j), ring):
-                    continue            # (a dry piece of an underwater tunnel: left out with it, GitHub #128)
-                g = np.asarray(self.elev(la, lo), np.float64)
-                if road_plans:
-                    g = g.copy()
-                    pack = PlanPack(list(road_plans)) if pack is None else pack
-                    g[[0, -1]] = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
-                pins = self._tunnel_pins((str(feats.ids[i]), j), ring)
-                pins = list(pins) if pins is not None else [float("nan"), float("nan")]
-                gc = None               # (the ground the cover is read on where g's ends are pinned)
-                for e, h in enumerate(pins):
-                    if np.isfinite(h):  # (a joint inside the hill: the tunnel network's floor, no portal there)
-                        if gc is None:
-                            g = g.copy()
-                            gc = g.copy()
-                        g[0 if e == 0 else -1] = h
-                        if portals is not None:
-                            portals[(str(feats.ids[i]), tuple(np.round(xy[0 if e == 0 else -1], 3)))] = False
-                sd = roadsmod.tunnel_sides(xy, ts[i])
-                sides = None
-                if sd is not None:      # (the ground beside it: a tunnel under flat ground is buried, as the meshes')
-                    sides = []
-                    for side in sd:
-                        sla, slo, _ = self.frame.enu_to_geodetic(side[:, 0], side[:, 1], 0.0)
-                        sides.append(np.asarray(self.elev(sla, slo), np.float64))
-                fl = {}
-                floor, kinds = roadsmod.tunnel_sections(s, g, cover_g=gc, sides=sides, flags=fl,
-                                                        portals=(not np.isfinite(pins[0]), not np.isfinite(pins[1])))
-                if not fl.get("buried"):
-                    kinds = roadsmod.portal_cover(kinds, (g if gc is None else gc) - floor, ts[i], s)
-                if over is None:
-                    over = self._roads_over_tunnels(feats, ts)
-                kinds = roadsmod.cover_roads(xy, s, kinds, *over, cover=(g if gc is None else gc) - floor)
-                i0 = 0
-                while i0 < len(kinds):
-                    i1 = i0
-                    while i1 + 1 < len(kinds) and kinds[i1 + 1] == kinds[i0]:
-                        i1 += 1
-                    a = max(0, i0 - 1)          # sharing the end sample with the section before
-                    if i1 > a:
-                        out.append((str(feats.ids[i]), ts[i], xy[a:i1 + 1], floor[a:i1 + 1], int(kinds[i0])))
-                    i0 = i1 + 1
+                for sub, _spec, xy, z, _lon in sorted(subs, key=lambda q: int(str(q[0]).rsplit("#", 1)[1])):
+                    n = int(str(sub).rsplit("#", 1)[1])
+                    kind = int(secs[n][2]) if n < len(secs) else 2
+                    xy = np.asarray(xy, np.float64)[:, :2]
+                    z = np.asarray(z, np.float64)
+                    if len(xy) < 2 or not np.isfinite(z).all():
+                        continue
+                    la, lo, h = geotiles.world_to_geodetic(st.frame, np.c_[xy, z])
+                    e_, n_, _ = self.frame.geodetic_to_enu(la, lo, 0.0)
+                    pxy = np.stack([np.asarray(e_, np.float64), np.asarray(n_, np.float64)], axis=1)
+                    # (by the section's own id, the networks' fid.part#section: its mouths are the networks' too)
+                    out.append((str(sub), ts[i], pxy, np.asarray(h, np.float64) - ROAD_LIFT, kind))
+                    if kind and portals is not None:
+                        for at, is_mouth in zip((0, -1), st.mouth(sub)):
+                            portals[(str(sub), tuple(np.round(pxy[at], 3)))] = bool(is_mouth)
         return out
-
-    def _roads_over_tunnels(self, feats, ts):
-        """([ground lines (k, 2) in the frame], [carriageway half widths]) of the roads near feats' tunnels (ts:
-        tunnel_specs), as roads.TunnelProfiles._cover_roads has them."""
-        import mapgeom
-        tun = [i for i in range(len(feats)) if ts[i] is not None]
-        boxes = roadsmod._feature_boxes(feats)
-        if not tun:
-            return [], []
-        pad = (roadsmod.TUNNEL_ROAD_REACH_M + 40.0) / 111320.0      # (lon/lat degrees, generous at high latitudes)
-        tb = boxes[tun]
-        rs = roadsmod.road_specs(feats)
-        lines, halves = [], []
-        for i in range(len(feats)):
-            if rs[i] is None:
-                continue
-            b = boxes[i]
-            k = 1.0 / max(math.cos(math.radians(0.5 * (b[1] + b[3]))), 0.05)
-            if not ((tb[:, 0] - pad * k <= b[2]) & (tb[:, 2] + pad * k >= b[0]) & (tb[:, 1] - pad <= b[3]) &
-                    (tb[:, 3] + pad >= b[1])).any():
-                continue
-            for ring in roadsmod.ground_parts(feats, i):
-                e, n = mapgeom.enu_xy(feats, self.frame, ring)
-                lines.append(np.stack([e, n], axis=1))
-                halves.append(rs[i].width / 2)
-        return lines, halves
 
     @staticmethod
     def _mouth_plans(secs, portals=None):
@@ -5674,11 +5809,11 @@ class _Planner:
         return self._plan_set(self._keys(lat, lon), roads_only)[0]
 
     @staticmethod
-    def _keys(lat, lon):
-        """The map cells whose plans can reach the points."""
+    def _keys(lat, lon, reach_m=None):
+        """The map cells whose plans can reach the points (reach_m: those within that distance)."""
         lat = np.asarray(lat, np.float64)
         lon = np.asarray(lon, np.float64)
-        pad = (T_MAX + 40.0) / 111320.0
+        pad = (T_MAX + 40.0 if reach_m is None else reach_m) / 111320.0
         padlon = pad / max(0.05, math.cos(math.radians(float(np.mean(lat)))))
         keys = mapcells.cells_for_points(lat, lon, pad, padlon)
         if len(keys) > SPREAD_CELLS:        # points far apart: only the cells around them
@@ -5701,7 +5836,8 @@ class _Planner:
         """(plans, PlanPack of them) of the cells keys: each road once, in the order of their keys. Remembered once all
         the cells are planned (a road tile asks for the same few cells' plans dozens of times: merging them cost a
         Canton tile set ~1.6 s, 2026-10-25)."""
-        self._plan_missing(keys)
+        if not roads_only:
+            self._plan_missing(keys)
         mk = (tuple(sorted(str(k) for k in keys)), bool(roads_only))
         memo = self.__dict__.setdefault("_plan_sets", {})
         with self.lock:
@@ -5710,7 +5846,9 @@ class _Planner:
             return hit
         got = {}
         for key in keys:
-            for fid_part, p in self._cell_plans(key):
+            # (roads_only: the cells' roads' plans alone, without planning their tunnels: a tunnel network's portals are
+            # graded by them while the cells that hold it are planned, _cell_road_plans)
+            for fid_part, p in (self._cell_road_plans(key) if roads_only else self._cell_plans(key)):
                 if roads_only and TUNNEL_TAG in fid_part:
                     continue
                 got.setdefault((fid_part, float(p.xy[0, 0]), float(p.xy[0, 1])), p)
@@ -5721,7 +5859,11 @@ class _Planner:
         # main's painted edge, not in its middle, TRIM_SIDE_MOUTHS_ON)
         out = (plans, merge_plan_set(plans))
         with self.lock:
-            if all(k in self.cells for k in keys):      # (not while a cell's fetch failed: it is asked again)
+            stages = self.__dict__.get("_road_stages", {})
+            # (not while a cell's fetch failed: it is asked again; the roads' plans alone: a cell's road stage is its
+            # plans' roads already)
+            read = self.__dict__.get("_road_kept", {})
+            if all(k in self.cells or (roads_only and (k in stages or k in read)) for k in keys):
                 if len(memo) >= PLAN_SETS_MAX:
                     memo.pop(next(iter(memo)))
                 memo[mk] = out
@@ -5742,7 +5884,10 @@ class _Planner:
         shape = base.shape
         if base.size == 0:
             return base
-        keys = self._keys(lat, lon)
+        # (roads_only, a tunnel's portal: the cells within PORTAL_REACH_M of it. A portal stands on its own road; the
+        # roads of a cell further off weigh under 2 % there, and reading them planned that cell's road stage for a
+        # cell that may never be visited: 2.9 CPU-s of four Fells Point cells' 13, 2026-11-12)
+        keys = self._keys(lat, lon, PORTAL_REACH_M if roads_only else None)
         if planned_only:
             keys = self._planned_keys(keys)
             if not keys:
@@ -5764,11 +5909,16 @@ class _Planner:
         race = self._on_kept(e, n)
         if race is not None:                # (the terrain is a racetrack's surface: GitHub #143, smoothed: #833)
             out[race] = self._raceway_ground(e[race], n[race], base.ravel()[race])
-        keep = self._over_tunnels(e, n)
+        # (roads_only: the roads' grading alone, the same whichever cells' tunnels are planned already: a tunnel's
+        # portal was at the graded road or at the bare ground by whether its own cover was known yet)
+        keep = None if roads_only else self._over_tunnels(e, n)
         if keep is not None:
             # (a small change stays: a road over the tunnel lies on its own graded profile, the ground over the tunnel
             # left ungraded under it stood a few cm over the E6's lanes as patches of bare ground, GitHub #2)
-            keep &= np.abs(out - base.ravel()) >= OVER_TUNNEL_SMALL_M
+            # (and a road over it that lies higher than the bare ground: only what would cut the cover down is undone;
+            # a street's smoothed profile 1 m over a dip in the ground over Vienna's A23 tunnel fell back to that dip
+            # in the strip over the tube, a ledge at each edge of it, 2026-11-12)
+            keep &= base.ravel() - out >= OVER_TUNNEL_SMALL_M
             out[keep] = base.ravel()[keep]
         return out.reshape(shape)
 
@@ -5880,6 +6030,12 @@ class PlanStore:
         self.tunnel_raw = None
         self.dem = None
         self.shared = None
+        # delegate(cell key): has another process plan the cell (its plans come through shared), returning when it has
+        # or could not; None: every cell is planned where it is asked for. The server's own process sets it
+        # (earthd.Server.plan_elsewhere): a first visit's far tiles, lakes and tunnels asked it for ~20 cells' plans,
+        # ~23 CPU-s on its "plans" threads under the interpreter lock its far textures and event loop need
+        # (22 % of its lock-holding samples on a cold Dijon visit, 2026-11-12)
+        self.delegate = None
         self.lock = threading.Lock()
         self.planners = OrderedDict()   # (rx, ry) -> _Planner, the least recently used first
 
