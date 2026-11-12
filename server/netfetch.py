@@ -267,6 +267,10 @@ POLICIES = {
     "canelevation-dem.s3.ca-central-1.amazonaws.com": HostPolicy(rate=20.0, burst=40.0, max_conc=6, daily_budget=None,
                                                                  allow_prefetch=True, offline_ok=True, miss_ttl=None,
                                                                  binary=True, timeout=30.0, optional=True),
+    # The Arctic's 2 m elevation mosaic (arcticdem.py): range reads of PGC's open bucket; optional (Mapterhorn stands in)
+    "pgc-opendata-dems.s3.us-west-2.amazonaws.com": HostPolicy(rate=20.0, burst=40.0, max_conc=6, daily_budget=None,
+                                                               allow_prefetch=True, offline_ok=True, miss_ttl=None,
+                                                               binary=True, timeout=30.0, optional=True),
     # OurAirports' nightly CSV dump on GitHub Pages (airports.py): two files (~3 MB gzipped) once a week,
     # one request at a time, a hard cap well above a week's need; the copy on disk serves offline
     "davidmegginson.github.io": HostPolicy(rate=0.2, burst=2.0, max_conc=1, daily_budget=20, daily_hard=40,
@@ -407,6 +411,8 @@ ROLES = {
     "s3.amazonaws.com": "terrain heights (backup source); only matters while the main one is down too",
     "copernicus-dem-30m.s3.amazonaws.com": "terrain heights near the poles",
     "canelevation-dem.s3.ca-central-1.amazonaws.com": "Canada's lidar ground under the distant terrain; as before meanwhile",
+    "pgc-opendata-dems.s3.us-west-2.amazonaws.com": "the detailed ground north of 60 N (ArcticDEM); coarser terrain "
+                                                     "meanwhile",
     "nrs.objectstore.gov.bc.ca": "British Columbia's detailed aerial photos (and its lidar, if on); coarser photos meanwhile",
     "stac.overturemaps.org": "the map data's file list; the copy that comes with the app is used meanwhile",
     "overturemaps-us-west-2.s3.us-west-2.amazonaws.com":

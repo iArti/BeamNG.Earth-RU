@@ -189,9 +189,16 @@ def switches_key():
     with _lock:
         if not _switches:
             h = hashlib.sha1()
-            for k in sorted(os.environ):
+            env = dict(os.environ)
+            # BeamNG.Earth-RU: ArcticDEM's ground (dem.ARCTICDEM) is on unless turned off, so its switch counts even
+            # unset: road plans made on upstream's heights (the forest tops north of 60 N) are not read back
+            env.setdefault("BNE_ARCTICDEM", "1")
+            if env["BNE_ARCTICDEM"] != "0":         # ... nor plans made on an older ArcticDEM ground
+                import arcticdem
+                env["BNE_ARCTICDEM"] += f":g{arcticdem.GROUND_VERSION}"
+            for k in sorted(env):
                 if k.startswith("BNE_") and k not in NOT_SWITCHES:
-                    h.update(f"{k}={os.environ[k]}".encode())
+                    h.update(f"{k}={env[k]}".encode())
             _switches.append(h.hexdigest()[:16])
         return _switches[0]
 

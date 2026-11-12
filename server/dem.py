@@ -37,10 +37,12 @@ import numpy as np
 from PIL import Image
 
 import cache as cachemod
+import cog as cogmod
 import dsmground
 import fast
 import hkdtm as hkdtmmod
 import hklidar
+import arcticdem as arcticdemmod
 import hrdem as hrdemmod
 import lidarbc as lidarbcmod
 import netfetch
@@ -83,6 +85,7 @@ MIRROR_MAX_AGE_S = 30 * 86400
 DECODED_VERSION = 4          # 2: tiles past the lidar's depth upsampled from its deepest tile, not z12; its holes
                              # filled (fill_holes); 3: Canada's HRDEM lidar (hrdem.py) from z13 down; 4: LidarBC,
                              # and z12 / z13 shifted to its ground (BIAS_*)
+ARCTIC_VERSION = arcticdemmod.GROUND_VERSION    # the mirror's tiles with ArcticDEM's ground in them
 MAX_ZOOM = 15               # AWS stops at z15 (the far field's zooms: zoom_for's default cap)
 # The near terrain and the road profiles read Mapterhorn's lidar one zoom deeper where it has it (the user, 2026-10-21:
 # "the terrain data gets smoothed ... sharper terrain features get lost": z16 is ~0.8 m a pixel at 48 N, z15 ~1.6 m, the
@@ -98,6 +101,9 @@ LIDARBC = HRDEM and os.environ.get("BNE_LIDARBC", "0") == "1"
 # towns: all road tiles at 33-53 s against 20-22 s without, 61-72 MB a place). Its coarse overview still lines the
 # far tiles up with the lidar ground (_hrdem_bias: a few MB).
 HRDEM_NEAR = HRDEM and os.environ.get("BNE_HRDEM_NEAR", "0") == "1"
+# The Arctic's 2 m mosaic (arcticdem.py: ArcticDEM made into ground) for the near terrain north of 60 N, where
+# Mapterhorn is Copernicus GLO-30 (BeamNG.Earth-RU). BNE_ARCTICDEM=0 turns it off.
+ARCTICDEM = os.environ.get("BNE_ARCTICDEM", "1") != "0"
 HRDEM_FEATHER_M = 60.0      # m over which HRDEM's edge blends into Mapterhorn's heights
 HRDEM_FEATHER_MAX_PX = 48
 # The distant terrain (z12 / z13: the far field's L2 / L3 rings, 1-4 km out): reading BC's 1 m lidar whole for it would
@@ -296,6 +302,8 @@ class Dem:
         self._cdn_idx = None            # (release, index bytes) once read
         self._cdn_failed_at = -1e18
         self._pack_locks = {}           # pack key -> lock: one fetch of a pack at a time in this process
+        self.arctic = arcticdemmod.ArcticDem(cache_dir, self.fetcher) if ARCTICDEM else None
+        self.arctic_served = set()      # tile keys with ArcticDEM ground in them
 
 
     def clear_memory(self):
@@ -472,6 +480,63 @@ class Dem:
         w = hrdemmod.feather(ok, min(HRDEM_FEATHER_MAX_PX, max(2, round(HRDEM_FEATHER_M / px))))
         return (a * (1.0 - w) + h * w).astype(np.float32)
 
+    def _arctic(self, key, a):
+        """Near tile key's heights a with ArcticDEM's ground (arcticdem.py) blended in where it has data (north of
+        60 N, z15 and deeper, as the lidar sources); a itself elsewhere or when it cannot be read."""
+        z, x, y = key
+        if getattr(self, "arctic", None) is None or a is None or not arcticdemmod.covers(z, x, y):
+            return a
+        if z < FINE_MIN_ZOOM:
+            return self._arctic_bias(key, a)
+        try:
+            got = self.arctic.tile(z, x, y, a)
+        except (netfetch.FetchError, OSError, ValueError, cogmod.CogError) as e:
+            self._count("arcticdem:error")
+            self._partial()                 # (not mirrored: asked again next time)
+            log.debug("arcticdem %s: %s", key, e)
+            return a
+        if got is None:
+            return a
+        h, ok = got
+        px = arcticdemmod.pixel_m(z, y)
+        w = hrdemmod.feather(ok, min(HRDEM_FEATHER_MAX_PX, max(2, round(HRDEM_FEATHER_M / px))))
+        self._count("arcticdem:tile")
+        with self._lock:
+            self.arctic_served.add(key)
+        return (a * (1.0 - w) + h * w).astype(np.float32)
+
+    def _arctic_bias(self, key, a):
+        """Distant tile key's heights a moved to ArcticDEM's ground level (its open land, from a coarse overview)
+        where Mapterhorn's sit off it, so the near terrain does not lie in a trench (as _hrdem_bias)."""
+        z, x, y = key
+        if z not in BIAS_ZOOMS:
+            return a
+        try:
+            got = self.arctic.sparse_ground(z, x, y)
+        except (netfetch.FetchError, OSError, ValueError, cogmod.CogError) as e:
+            self._count("arcticdem-bias:error")
+            self._partial()
+            log.debug("arcticdem bias %s: %s", key, e)
+            return a
+        if got is None:
+            return a
+        out = self._shift_to(key, a, *got)
+        if out is not a:
+            self._count("arcticdem-bias:tile")
+            with self._lock:
+                self.arctic_served.add(key)
+        return out
+
+    def arctic_at(self, lat, lon):
+        """Does ArcticDEM's ground serve the near terrain at (lat, lon)?"""
+        if getattr(self, "arctic", None) is None or lat < arcticdemmod.MIN_LAT:
+            return False
+        known = arcticdemmod.index()
+        if known is None:
+            return True
+        x, y = arcticdemmod.polar_xy(lat, lon)
+        return arcticdemmod.file_of(float(x), float(y)) in known
+
     def polar(self):
         """The polar caps' DEM (made on first use)."""
         p = getattr(self, "_polar", None)
@@ -547,6 +612,8 @@ class Dem:
         if idx.get((x, max(0, min(n - 1, y))), GLOBAL_ZOOM) > GLOBAL_ZOOM:
             return False
         if (self.lidarbc is not None or HRDEM_NEAR) and hrdemmod.covers(GLOBAL_ZOOM, *_tile_xy(lat, lon, GLOBAL_ZOOM)):
+            return False
+        if self.arctic_at(lat, lon):
             return False
         return True
 
@@ -920,7 +987,8 @@ class Dem:
     def _mirror_path(self, key):
         z, x, y = key
         hk = "h" if self.hkdtm is not None and hkdtmmod.covers(z, x, y) else ""     # (made with Hong Kong's DTM)
-        return os.path.join(self.cache_dir, "decoded", f"v{DECODED_VERSION}", f"g{int(self.ground_filter)}{hk}", str(z),
+        version = f"v{DECODED_VERSION}" + (f"-arctic{ARCTIC_VERSION}" if getattr(self, "arctic", None) else "")
+        return os.path.join(self.cache_dir, "decoded", version, f"g{int(self.ground_filter)}{hk}", str(z),
                             str(x), f"{y}{'.f32z' if MIRROR_ZSTD else '.npy'}")
 
     def _mirror_get(self, key, readback=False):
@@ -1078,7 +1146,7 @@ class Dem:
         return None
 
     def _make_tile(self, key):
-        return self._hongkong(key, self._canada(key, self._make_tile0(key)))
+        return self._arctic(key, self._hongkong(key, self._canada(key, self._make_tile0(key))))
 
     def _make_tile0(self, key):
         z, x, y = key

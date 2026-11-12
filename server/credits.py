@@ -75,6 +75,7 @@ ELEVATION = {
              "(Natural Resources Canada, HRDEM - CanElevation Series)",
     "hkdtm": "2020 LiDAR terrain model of the Civil Engineering and Development Department, (c) Government of the Hong "
              "Kong SAR, from DATA.GOV.HK and the CSDI Portal, data changed",
+    "arcticdem": __import__("arcticdem").ATTRIBUTION,
     polardem.SOURCE: "Produced using Copernicus WorldDEM-30 (c) DLR e.V. 2010-2014 and (c) Airbus Defence and Space GmbH "
                      "2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved",
 }
@@ -102,6 +103,7 @@ SHORT = {
     f"dem:{polardem.SOURCE}": "Copernicus DEM (DLR, Airbus)",
     "dem:hrdem": "NRCan HRDEM (OGL-Canada)", "dem:lidarbc": "LidarBC (OGL-BC)",
     "dem:hkdtm": "HK Gov CEDD LiDAR (DATA.GOV.HK, CSDI)",
+    "dem:arcticdem": "ArcticDEM (PGC)",
     WEATHER_ID: "Open-Meteo",
 }
 # Every other source that built what is near the player (the user, 2026-10-18: "show all sources", not only those
@@ -369,6 +371,8 @@ def tile_sources(frame, bbox, dem, zoom, used):
                 ids.add("dem:lidarbc")
             if k in getattr(dem, "hkdtm_served", ()):
                 ids.add("dem:hkdtm")
+            if k in getattr(dem, "arctic_served", ()):
+                ids.add("dem:arcticdem")
     if callable(getattr(dem, "polar", None)) and polar_covered(frame, bbox, dem.polar()):
         ids.add(f"dem:{polardem.SOURCE}")
     return frozenset(ids)
